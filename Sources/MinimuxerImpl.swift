@@ -565,8 +565,12 @@ final internal class MinimuxerImpl: MinimuxerAPI {
             // usbmuxd proxy to be listening on 127.0.0.1:27015 — even in .lockdown mode
             // where requiresUsbmuxd is false.
             if !self.proxyServer.isListening {
-                let udid = (self.gateway.pairingDataDict?["UDID"] as? String)
-                    ?? (try await self.fetchUDID())
+                let udid: String
+                if let cached = self.gateway.pairingDataDict?["UDID"] as? String {
+                    udid = cached
+                } else {
+                    udid = try await self.fetchUDID()
+                }
                 try await self.proxyServer.start(udid: udid)
                 var waited: UInt64 = 0
                 while !self.proxyServer.isListening && waited < 3_000_000_000 {
@@ -609,8 +613,12 @@ final internal class MinimuxerImpl: MinimuxerAPI {
             // usbmuxd proxy to be listening on 127.0.0.1:27015 — even in .lockdown mode
             // where requiresUsbmuxd is false.
             if !self.proxyServer.isListening {
-                let udid = (self.gateway.pairingDataDict?["UDID"] as? String)
-                    ?? (try await self.fetchUDID())
+                let udid: String
+                if let cached = self.gateway.pairingDataDict?["UDID"] as? String {
+                    udid = cached
+                } else {
+                    udid = try await self.fetchUDID()
+                }
                 try await self.proxyServer.start(udid: udid)
                 var waited: UInt64 = 0
                 while !self.proxyServer.isListening && waited < 3_000_000_000 {
