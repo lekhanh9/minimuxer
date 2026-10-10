@@ -564,6 +564,13 @@ final internal class MinimuxerImpl: MinimuxerAPI {
             // connectDebugProxy uses the usbmuxd C API, which requires the fake
             // usbmuxd proxy to be listening on 127.0.0.1:27015 — even in .lockdown mode
             // where requiresUsbmuxd is false.
+            //
+            // Also force the USBMUXD_SOCKET_ADDRESS env var to TCP.
+            // idevice_usbmuxd_new_default_connection reads this env var;
+            // without it, FFI falls back to /var/run/usbmuxd (unix socket),
+            // which doesn't exist on iOS self-contained mode.
+            self.retargetUsbmuxdAddr()
+
             if !self.proxyServer.isListening {
                 let udid: String
                 if let cached = self.gateway.pairingDataDict?["UDID"] as? String {
@@ -612,6 +619,13 @@ final internal class MinimuxerImpl: MinimuxerAPI {
             // connectDebugProxy uses the usbmuxd C API, which requires the fake
             // usbmuxd proxy to be listening on 127.0.0.1:27015 — even in .lockdown mode
             // where requiresUsbmuxd is false.
+            //
+            // Also force the USBMUXD_SOCKET_ADDRESS env var to TCP.
+            // idevice_usbmuxd_new_default_connection reads this env var;
+            // without it, FFI falls back to /var/run/usbmuxd (unix socket),
+            // which doesn't exist on iOS self-contained mode.
+            self.retargetUsbmuxdAddr()
+
             if !self.proxyServer.isListening {
                 let udid: String
                 if let cached = self.gateway.pairingDataDict?["UDID"] as? String {
