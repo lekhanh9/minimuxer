@@ -69,12 +69,19 @@ internal enum PairingTLSExtractor {
             throw PairingTLSError.keychainError(-1, "cert ref nil")
         }
 
-        var identity: SecIdentity? = nil
-        let idStatus = SecIdentityCreateWithCertificate(nil, certFromChain, &identity)
-        guard idStatus == errSecSuccess, let id = identity else {
-            throw PairingTLSError.keychainError(idStatus, "SecIdentityCreateWithCertificate")
+        // iOS doesn't expose SecIdentityCreateWithCertificate (macOS-only public API).
+        // Use SecItemCopyMatching with kSecClassIdentity + kSecMatchCertificateRef
+        // to find the identity formed by the just-added cert + key.
+        let idQuery: [String: Any] = [
+            kSecClass as String: kSecClassIdentity,
+            kSecMatchCertificateRef as String: certFromChain,
+            kSecReturnRef as String: true,
+        ]
+        var idResult: CFTypeRef? = nil
+        let idStatus = SecItemCopyMatching(idQuery as CFDictionary, &idResult)
+        guard idStatus == errSecSuccess, let id = idResult as! SecIdentity? else {
+            throw PairingTLSError.keychainError(idStatus, "SecItemCopyMatching identity lookup")
         }
-
         return id
     }
 
