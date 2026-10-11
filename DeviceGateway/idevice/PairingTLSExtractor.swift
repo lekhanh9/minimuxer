@@ -164,7 +164,7 @@ struct PairingTLSExtractor {
                        b[10] == 0x109 && b[11] == 0x2a && b[12] == 0x86 &&
                        b[13] == 0x48 && b[14] == 0x86 && b[15] == 0xf7 &&
                        b[16] == 0x0d && b[17] == 0x01 && b[18] == 0x01 &&
-                       b[19] == 0x01 && b[20] ==DER 0x05 && b[21] == 0x00 &&
+                       b[19] == 0x01 && b[20] == 0x05 && b[21] == 0x00 &&
                        b[22] == 0x04 && b[23] == 0x82)
         if !isPKCS8 { return der }
 
@@ -248,7 +248,7 @@ struct PairingTLSExtractor {
         }
         NSLog("[PairingTLSExtractor] key imported (status=%d)", ks)
 
-        // 3) Query identity (iOS-only path — SecIdentityCreateWithCertificate
+        // 3) Query identity (iOS-only path -- SecIdentityCreateWithCertificate
         //    does not exist on iOS).
         var idOut: CFTypeRef?
         let q: [CFString: Any] = [
