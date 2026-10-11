@@ -474,7 +474,14 @@ final internal class MinimuxerImpl: MinimuxerAPI {
     }
 
     private func ensureDDIMounted() async throws(MinimuxerError) {
-        let isMounted = (try? await self.gateway.isDDIMounted()) ?? false
+        // FIX: do not swallow errors. A failed query is not the same as "DDI not mounted";
+        // trying to (re)upload the DDI over a broken connection only makes things worse.
+        let isMounted: Bool
+        do {
+            isMounted = try await self.gateway.isDDIMounted()
+        } catch {
+            throw MinimuxerError.mount(protocol: self.gateway.pairingFileType, reason: "Failed to query DDI status: \(error)")
+        }
         if isMounted {
             return
         }

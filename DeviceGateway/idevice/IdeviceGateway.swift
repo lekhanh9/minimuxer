@@ -24,6 +24,29 @@ internal final class IdeviceGatewayError: DeviceGatewayError, @unchecked Sendabl
 
 
 
+/// True when the message/error describes a dropped or reset device connection
+/// (stale TLS session, broken pipe, ...). Such failures are transient and must
+/// NOT be interpreted as a real answer from the device (e.g. "DDI not mounted").
+internal func isTransportErrorText(_ text: String) -> Bool {
+    let t = text.lowercased()
+    return t.contains("unexpectedeof")
+        || t.contains("close_notify")
+        || t.contains("early eof")
+        || t.contains("brokenpipe")
+        || t.contains("broken pipe")
+        || t.contains("connectionreset")
+        || t.contains("connection reset")
+        || t.contains("connectionaborted")
+        || t.contains("notconnected")
+}
+
+internal func isTransportError(_ error: Error) -> Bool {
+    if let e = error as? DeviceGatewayError {
+        return isTransportErrorText(e.reason)
+    }
+    return isTransportErrorText("\(error)") || isTransportErrorText(error.localizedDescription)
+}
+
 extension String {
     // Un-escapes literal "\\n" and "\\\"" escape sequences into real line breaks and quotes.
     var cleanedErrorFormatting: String {
@@ -551,7 +574,30 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         return try action(client)
     }
 
+    /// Retries the whole connect+action on transient transport errors
+    /// (UnexpectedEof / BrokenPipe / ConnectionReset). Every fresh attempt builds a new
+    /// provider and a new TLS session, so a stale connection cannot poison the retry.
     private func performWithTcpService<T>(
+        connect: @escaping (OpaquePointer?, UnsafeMutablePointer<OpaquePointer?>?) -> UnsafeMutablePointer<IdeviceFfiError>?,
+        cleanup: @escaping (OpaquePointer?) -> Void,
+        serviceName: String,
+        action: (OpaquePointer) throws -> T
+    ) throws -> T {
+        let maxAttempts = 3
+        var attempt = 0
+        while true {
+            attempt += 1
+            do {
+                return try performWithTcpServiceOnce(connect: connect, cleanup: cleanup, serviceName: serviceName, action: action)
+            } catch {
+                guard attempt < maxAttempts, isTransportError(error) else { throw error }
+                debugLog("[IdeviceGateway] performWithTcpService(\(serviceName)) transport error on attempt \(attempt)/\(maxAttempts): \(error). Retrying with a fresh session...")
+                Thread.sleep(forTimeInterval: 0.4 * Double(attempt))
+            }
+        }
+    }
+
+    private func performWithTcpServiceOnce<T>(
         connect: @escaping (OpaquePointer?, UnsafeMutablePointer<OpaquePointer?>?) -> UnsafeMutablePointer<IdeviceFfiError>?,
         cleanup: @escaping (OpaquePointer?) -> Void,
         serviceName: String,
@@ -1299,6 +1345,17 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         // PATCH: keep client alive for whole debug session. Do NOT free here.
         // Reset via disableJIT(appId:).
         self.activeDebugClient = debugProxyClient
+        var launchSucceeded = false
+        defer {
+            // FIX: on failure never leave a dead client behind (it kept the gateway
+            // in "debug active" state and broke every later service connection).
+            if !launchSucceeded {
+                if let c = self.activeDebugClient {
+                    debug_proxy_free(c)
+                    self.activeDebugClient = nil
+                }
+            }
+        }
 
         verboseLog("[IdeviceGateway] launchAppPre17() configuring debug proxy workspace")
         try self.sendDebugProxyCommand(client: debugProxyClient, name: "QSetMaxPacketSize", args: ["\(MinimuxerConstants.maxPacketSize)"])
@@ -1315,8 +1372,6 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         // Correct GDB RSP format: A<arglen_dec>,<argnum_dec>,<hexdata>
         // argnum = 0 for the first (and only) argument: the executable path.
         // No "argc" field. No separate arg0_len.
-        let pathByteCount = exePath.utf8.count
-        let hexData = exePath.utf8.map { String(format: "%02x", $0) }.joined()
         // GDB RSP handshake: negotiate + disable ack mode BEFORE A packet.
         // StikJIT/StikDebug send qSupported and QStartNoAckMode first.
         let qSup = try? self.sendDebugProxyCommand(client: debugProxyClient, name: "qSupported", args: ["multiprocess+"])
@@ -1326,17 +1381,26 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         // waiting for ack. All subsequent packets (A/qLaunchSuccess/c)
         // get no reply. Stay in ack mode - the wrapper handles acks.
 
-        // debugserver parses arglen via strtoul(..., 10) -> DECIMAL.
-        // Include NUL terminator: arglen = pathBytes + 1, hexData ends with "00".
-        let aLen = String(exePath.utf8.count + 1)
-        let aHex = exePath.utf8.map { String(format: "%02x", $0) }.joined() + "00"
-        let aPacket = "A\(aLen),0,\(aHex)"
+        // FIX: arglen is the length of the HEX-ENCODED argument (number of hex characters),
+        // parsed as decimal by debugserver (same as idevice: arg.len() * 2).
+        // The old code sent the BYTE count (+1) -> 102 for a 101 byte path, while the hex payload
+        // was 204 chars. debugserver only read the first 102 hex chars (51 bytes), so the path was
+        // truncated to ".../Application/6D10B8BB" and launch failed with
+        // "ENo such file or directory (.../6D10B8BB)".
+        let aHex = exePath.utf8.map { String(format: "%02x", $0) }.joined() + "00"   // + NUL terminator
+        let aPacket = "A\(aHex.count),0,\(aHex)"
         verboseLog("[IdeviceGateway] launchAppPre17() A packet FULL: \(aPacket)")
         let argvResponse = try self.sendDebugProxyCommand(client: debugProxyClient, name: aPacket, args: [])
         verboseLog("[IdeviceGateway] launchAppPre17() argv response: \(argvResponse ?? "(nil)")")
+        if let r = argvResponse, r.hasPrefix("E") {
+            throw IdeviceGatewayError(.serviceError, reason: "debugserver rejected argv (A packet): \(r)")
+        }
 
         verboseLog("[IdeviceGateway] launchAppPre17() launching application")
-        try self.sendDebugProxyCommand(client: debugProxyClient, name: "qLaunchSuccess", args: [])
+        let launchResponse = try self.sendDebugProxyCommand(client: debugProxyClient, name: "qLaunchSuccess", args: [])
+        if let r = launchResponse, r.hasPrefix("E") {
+            throw IdeviceGatewayError(.serviceError, reason: "debugserver failed to launch app: \(r)")
+        }
         // PATCH: continue app after launch, but DO NOT detach.
         // Without "c" the app stays stopped at entry and user sees nothing.
         // With "D" the app runs but kernel clears CS_DEBUGGED -> no JIT.
@@ -1345,6 +1409,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         // PATCH: do NOT send D here - keep debugserver attached so
         // kernel keeps CS_DEBUGGED on the target process. Detach only
         // happens in disableJIT().
+        launchSucceeded = true
         debugLog("[IdeviceGateway] launchAppPre17() app launched successfully")
     }
 
@@ -1748,7 +1813,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
                 return true
             }
             // Classic Developer DDI (iOS 16 and below)
-            if isLegacyDeveloperImageMounted(mounterClient: client) {
+            if try isLegacyDeveloperImageMounted(mounterClient: client) {
                 debugLog("[IdeviceGateway] isDDIMounted() legacy Developer DDI is mounted")
                 return true
             }
@@ -1759,7 +1824,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
     // Detects the classic (non-personalized) Developer disk image used by iOS 16 and below.
     // The device answers LookupImage("Developer") with an ImageSignature only when it is mounted.
-    private func isLegacyDeveloperImageMounted(mounterClient: OpaquePointer) -> Bool {
+    private func isLegacyDeveloperImageMounted(mounterClient: OpaquePointer) throws -> Bool {
         var sigPtr: UnsafeMutablePointer<UInt8>? = nil
         var sigLen: Int = 0   // if the compiler complains about Int vs UInt here, change Int to UInt
         let err = "Developer".withCString { typePtr in
@@ -1767,8 +1832,13 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         }
         if let err = err {
             // An error here means "not mounted" (or lookup unsupported)
-            verboseLog("[IdeviceGateway] isLegacyDeveloperImageMounted() lookup returned error: \(getErrorMessage(from: err))")
+            let lookupMsg = getErrorMessage(from: err)
+            verboseLog("[IdeviceGateway] isLegacyDeveloperImageMounted() lookup returned error: \(lookupMsg)")
             safeFreeError(err)
+            // FIX: transport errors must surface (and be retried), only a real device answer means "not mounted".
+            if isTransportErrorText(lookupMsg) {
+                throw IdeviceGatewayError(.serviceError, reason: "Failed to look up Developer image, error: (\(lookupMsg))")
+            }
             return false
         }
         let mounted = sigLen > 0
@@ -1792,6 +1862,10 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             }
             debugLog("[IdeviceGateway] copy_devices failed: code=\(code), subCode=\(subCode), message=\(msg)")
             defer { idevice_error_free(err) }
+            // FIX: a dropped connection is NOT "no DDI mounted".
+            if isTransportErrorText(msg) {
+                throw IdeviceGatewayError(.serviceError, reason: "Failed to query mounted images, error: (\(msg))")
+            }
             return false
         }
         guard let devicesPtr = devicesPtr, devicesLen > 0 else {
@@ -1848,7 +1922,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             serviceName: "image mounter"
         ) { client in
             // 0. Skip everything if a classic Developer image is already mounted
-            if self.isLegacyDeveloperImageMounted(mounterClient: client) {
+            if try self.isLegacyDeveloperImageMounted(mounterClient: client) {
                 debugLog("[IdeviceGateway] mountDeveloperImage() Developer image already mounted. Bypassing upload and mount.")
                 return
             }
@@ -2539,8 +2613,15 @@ extension IdeviceGateway {
         // via idevice_start_session using the pairing host identity.
         self.isDebugActive = true
         // PATCH: isDebugActive stays true whole session; reset in disableJIT only.
-        try await withFFIDispatch {
-            try self.syncDebugApp(appId: appId)
+        do {
+            try await withFFIDispatch {
+                try self.syncDebugApp(appId: appId)
+            }
+        } catch {
+            // FIX: a failed attempt must not leave "debug active" set, otherwise heartbeats
+            // stay skipped forever and the device drops our services.
+            self.isDebugActive = false
+            throw error
         }
     }
 
