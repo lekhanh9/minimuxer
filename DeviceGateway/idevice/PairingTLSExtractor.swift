@@ -39,53 +39,69 @@ internal enum PairingTLSExtractor {
         }
         let key = try createRSAKey(from: hostKeyData)
 
-        // Import into keychain (temp tag), then build SecIdentity
-        let tag = "minimuxer.debug.tls.\(UUID().uuidString)".data(using: .utf8)!
-        var keyPersistentRef: CFTypeRef? = nil
-        let keyAttrs: [String: Any] = [
+        let tag = "minimuxer.debug.tls".data(using: .utf8)!
+
+        // Clean old items with same tag (idempotent)
+        SecItemDelete([
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: tag,
+        ] as CFDictionary)
+        SecItemDelete([
+            kSecClass as String: kSecClassCertificate,
+            kSecAttrApplicationTag as String: tag,
+        ] as CFDictionary)
+
+        // Add private key with tag
+        let addKeyStatus = SecItemAdd([
             kSecClass as String: kSecClassKey,
             kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
             kSecAttrApplicationTag as String: tag,
             kSecValueRef as String: key,
-            kSecReturnPersistentRef as String: true,
-        ]
-        let addKeyStatus = SecItemAdd(keyAttrs as CFDictionary, &keyPersistentRef)
-        guard addKeyStatus == errSecSuccess || addKeyStatus == errSecDuplicateItem else {
+        ] as CFDictionary, nil)
+        guard addKeyStatus == errSecSuccess else {
             throw PairingTLSError.keychainError(addKeyStatus, "add RSA key")
         }
 
-        var certRef: CFTypeRef? = nil
-        let certAttrs: [String: Any] = [
+        // Add certificate with same tag — iOS links cert+key with same tag into identity
+        let addCertStatus = SecItemAdd([
             kSecClass as String: kSecClassCertificate,
+            kSecAttrApplicationTag as String: tag,
             kSecValueRef as String: cert,
-            kSecReturnRef as String: true,
-        ]
-        let addCertStatus = SecItemAdd(certAttrs as CFDictionary, &certRef)
-        guard addCertStatus == errSecSuccess || addCertStatus == errSecDuplicateItem else {
+        ] as CFDictionary, nil)
+        guard addCertStatus == errSecSuccess else {
             throw PairingTLSError.keychainError(addCertStatus, "add cert")
         }
 
-        guard let certFromChain = certRef as! SecCertificate? else {
-            throw PairingTLSError.keychainError(-1, "cert ref nil")
-        }
-
-        // iOS doesn't expose SecIdentityCreateWithCertificate (macOS-only public API).
-        // Use SecItemCopyMatching with kSecClassIdentity + kSecMatchCertificateRef
-        // to find the identity formed by the just-added cert + key.
-        let idQuery: [String: Any] = [
-            kSecClass as String: kSecClassIdentity,
-            kSecMatchCertificateRef as String: certFromChain,
-            kSecReturnRef as String: true,
-        ]
+        // Query identity by applicationTag
         var idResult: CFTypeRef? = nil
-        let idStatus = SecItemCopyMatching(idQuery as CFDictionary, &idResult)
-        guard idStatus == errSecSuccess, let id = idResult as! SecIdentity? else {
-            throw PairingTLSError.keychainError(idStatus, "SecItemCopyMatching identity lookup")
+        let idStatus = SecItemCopyMatching([
+            kSecClass as String: kSecClassIdentity,
+            kSecAttrApplicationTag as String: tag,
+            kSecReturnRef as String: true,
+        ] as CFDictionary, &idResult)
+        guard idStatus == errSecSuccess, let cfId = idResult else {
+            throw PairingTLSError.keychainError(idStatus, "identity lookup by tag")
         }
+        guard CFGetTypeID(cfId) == SecIdentityGetTypeID() else {
+            throw PairingTLSError.keychainError(-1, "match result not SecIdentity")
+        }
+        return (cfId as! SecIdentity)
+    }
+
+FTypeRef? = nil
+        let idStatus = SecItemCopyMatching(idQuery as CFDictionary, &idResult)
+        guard idStatus == errSecSuccess, let cfId = idResult else {
+            throw PairingTLSError.keychainError(idStatus, "identity lookup by tag")
+        }
+        // Force cast via CFTypeID check
+        guard CFGetTypeID(cfId) == SecIdentityGetTypeID() else {
+            throw PairingTLSError.keychainError(-1, "match result is not SecIdentity")
+        }
+        let id = cfId as! SecIdentity
         return id
     }
 
-    private static func createRSAKey(from pkcs1Data: Data) throws -> SecKey {
+(from pkcs1Data: Data) throws -> SecKey {
         let attrs: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
             kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
