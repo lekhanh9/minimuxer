@@ -2519,6 +2519,18 @@ extension IdeviceGateway {
     }
 
     public func debugApp(appId: String) async throws {
+        // PATCH: pre-cleanup any previous debug session before starting new one.
+        // Without this, isDebugActive stays true forever and lockdownd services
+        // held by the old debugserver session conflict with image mounter.
+        if let oldClient = self.activeDebugClient {
+            _ = try? self.sendDebugProxyCommand(client: oldClient, name: "D", args: [])
+            debug_proxy_free(oldClient)
+            self.activeDebugClient = nil
+        }
+        self.isDebugActive = false
+        // Small settle delay so device releases lockdownd service handles.
+        try? await Task.sleep(nanoseconds: 500_000_000)
+
         // All paths go through syncDebugApp -> launchAppPre17 -> connectDebugProxy.
         // When lockdownd_start_service reports ssl=true (DVTSecureSocketProxy on
         // iOS 16+), connectDebugProxy transparently performs the TLS handshake
