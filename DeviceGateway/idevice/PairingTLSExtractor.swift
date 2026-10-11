@@ -23,6 +23,7 @@ internal enum PairingTLSError: Error, CustomStringConvertible {
 }
 
 internal enum PairingTLSExtractor {
+
     static func extractIdentity(from pairingFileData: Data) throws -> SecIdentity {
         let plist = try PropertyListSerialization.propertyList(from: pairingFileData, options: [], format: nil)
         guard let dict = plist as? [String: Any] else {
@@ -82,26 +83,10 @@ internal enum PairingTLSExtractor {
         guard idStatus == errSecSuccess, let cfId = idResult else {
             throw PairingTLSError.keychainError(idStatus, "identity lookup by tag")
         }
-        guard CFGetTypeID(cfId) == SecIdentityGetTypeID() else {
-            throw PairingTLSError.keychainError(-1, "match result not SecIdentity")
-        }
         return (cfId as! SecIdentity)
     }
 
-FTypeRef? = nil
-        let idStatus = SecItemCopyMatching(idQuery as CFDictionary, &idResult)
-        guard idStatus == errSecSuccess, let cfId = idResult else {
-            throw PairingTLSError.keychainError(idStatus, "identity lookup by tag")
-        }
-        // Force cast via CFTypeID check
-        guard CFGetTypeID(cfId) == SecIdentityGetTypeID() else {
-            throw PairingTLSError.keychainError(-1, "match result is not SecIdentity")
-        }
-        let id = cfId as! SecIdentity
-        return id
-    }
-
-(from pkcs1Data: Data) throws -> SecKey {
+    private static func createRSAKey(from pkcs1Data: Data) throws -> SecKey {
         let attrs: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
             kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
