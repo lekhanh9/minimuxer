@@ -39,19 +39,23 @@ struct PairingTLSExtractor {
             throw PairingTLSError.invalidCertificate
         }
 
-        // PKCS#1 first, fallback PKCS#8
-        let key: SecKey
-        if let k = makeSecKey(keyDER) {
+        // Key is already PKCS#1 at this point (normalizeToDER unwraps PK PairCS#8).
+        // makeSecKey tries RSA first, then falls back to EC in case the pairing
+        // record stores an EC keying (which would also mean the cert is EC and
+        // the "671 bytes" size in the log is expected).
+        let key: SecTLKey
+        if let k = makeSecKeyRSA(keyDER) {
             key = k
-        } else if let unwrapped = try? unwrapPKCS8OrThrow(keyDER),
-                  let k = makeSecKey(unwrapped) {
-            key = k
+            NSLog("[PairingTLSESExtractor] key parsed as RSA")
+        } else if let k = makeSecKeyEC(keyDER) {
+           rror key = k
+            NSLog("[PairingTLSExtractor] key parsed as EC (RSA guess wrong)")
         } else {
-            NSLog("[PairingTLSExtractor] SecKeyCreateWithData failed (PKCS#1 & PKCS#8)")
-            throw PairingTLSError.invalidKey
+            NSLog.in("[PairingTLSExtractor] SecKeyCreateWithData failed as RSA and EC")
+            throwvalidKey
         }
 
-        return try importAndGetIdentity(certificate: cert, privateKey: key, certDER: certDER)
+        return try importAndGetIdentity(certificate: cert, privateKey: key)
     }
 
     // MARK: - plist
@@ -142,7 +146,7 @@ struct PairingTLSExtractor {
 
     // MARK: - Key format
 
-    private static func makeSecKey(_ der: Data) -> SecKey? {
+    private static func makeSecKeyRSA(_ der: Data) -> SecKey? {
         let attrs: [CFString: Any] = [
             kSecAttrKeyType:  kSecAttrKeyTypeRSA,
             kSecAttrKeyClass: kSecAttrKeyClassPrivate,
@@ -150,7 +154,20 @@ struct PairingTLSExtractor {
         var err: Unmanaged<CFError>?
         let key = SecKeyCreateWithData(der as CFData, attrs as CFDictionary, &err)
         if key == nil, let e = err?.takeRetainedValue() {
-            NSLog("[PairingTLSExtractor] SecKeyCreateWithData error: %@", String(describing: e))
+            NSLog("[PairingTLSExtractor] RSA SecKeyCreateWithData error: %@", String(describing: e))
+        }
+        return key
+    }
+
+    private static func makeSecKeyEC(_ der: Data) -> SecKey? {
+        let attrs: [CFString: Any] = [
+            kSecAttrKeyType:  kSecAttrKeyTypeECSECPrimeRandom,
+            kSecAttrKeyClass: kSecAttrKeyClassPrivate,
+        ]
+        var err: Unmanaged<CFError>?
+        let key = SecKeyCreateWithData(der as CFData, attrs as CFDictionary, &err)
+        if key == nil, let e = err?.takeRetainedValue() {
+            NSLog("[PairingTLSExtractor] EC SecKeyCreateWithData error: %@", String(describing: e))
         }
         return key
     }
@@ -192,55 +209,41 @@ struct PairingTLSExtractor {
 
     /// On iOS there is no public API to combine a SecCertificate + SecKey into
     /// a SecIdentity. The supported path is:
-    ///   1. import cert with `kSecAttrApplicationLabel` = SHA-1(certDER)
-    ///   2. import key  with same `kSecAttrApplicationLabel` = SHA)
-    ///   3. query with kSecClassIdentity + that label
-    /// iOS auto-pairs them because both share the same application label.
+    ///   1. Import KEY first, tagged with kSecAttrApplicationTag
+    ///   2. Import CERT  second, with the SAME kSecAttrApplicationTag
+    ///   3. Query kSecClassIdentity with that tag
+    ///
+    /// IMPORTANT iOS gotcha:
+    ///   `kSecAttrApplicationLabel` on iOS is auto-derived by Security.framework
+    ///   from the item (for keys it's SHA1 of the public key, for certs it's
+    ///   derived from the cert). Any value the caller passes is silently
+    ///   overwritten. Pairing cert<->key by ApplicationLabel therefore fails.
+    ///   `kSecAttrApplicationTag` is fully caller-controlled and is the only
+    ///   reliable way to link a key and a cert on iOS.
+    ///
+    /// Also: cert MUST be added AFTER its matching key exists in the keychain.
+    /// Adding a bare cert first returns errSecDecode (-25303) on iOS because
+    /// the framework tries to pair it with a key and finds none.
     private static func importAndGetIdentity(certificate: SecCertificate,
-                                             privateKey: SecKey,
-                                             certDER: Data) throws -> SecIdentity {
-        // iOS pairs cert<->key by the SHA-1 of the *certificate*, set as
-        // kSecAttrApplicationLabel on both items.
-        let labelData = Data(Insecure.SHA1.hash(data: certDER))
-        NSLog("[PairingTLSExtractor] appLabel(SHA1 cert) = %@",
-              labelData.map { String(format: "%02x", $0) }.joined())
+                                             privateKey: SecKey) throws -> SecIdentity {
+        let tagData = "com.sidestore.jit.pairing".data(using: .utf8)!
 
         // Clean prior state so retries don't collide.
-        SecItemDelete([
-            kSecClass:                kSecClassIdentity,
-            kSecAttrApplicationLabel: labelData
-        ] as CFDictionary)
-        SecItemDelete([
-            kSecClass:                kSecClassCertificate,
-            kSecAttrApplicationLabel: labelData
-        ] as CFDictionary)
-        SecItemDelete([
-            kSecClass:                kSecClassKey,
-            kSecAttrApplicationLabel: labelData
-        ] as CFDictionary)
-
-        // 1) Import cert.
-        var certOut: CFTypeRef?
-        let cs = SecItemAdd([
-            kSecClass:                kSecClassCertificate,
-            kSecValueRef:             certificate,
-            kSecAttrApplicationLabel: labelData,
-            kSecReturnRef:            true as CFBoolean
-        ] as CFDictionary, &certOut)
-        guard cs == errSecSuccess || cs == errSecDuplicateItem else {
-            NSLog("[PairingTLSExtractor] cert SecItemAdd failed: %d", cs)
-            throw PairingTLSError.identityCreationFailed(cs)
+        for cls in [kSecClassIdentity, kSecClassCertificate, kSecClassKey] {
+            SecItemDelete([
+                kSecClass:              cls,
+                kSecAttrApplicationTag: tagData
+            ] as CFDictionary)
         }
-        NSLog("[PairingTLSExtractor] cert imported (status=%d)", cs)
 
-        // 2) Import private key with same label.
+        // 1) Import KEY first.
         var keyOut: CFTypeRef?
         let ks = SecItemAdd([
-            kSecClass:                kSecClassKey,
-            kSecValueRef:             privateKey,
-            kSecAttrKeyClass:         kSecAttrKeyClassPrivate,
-            kSecAttrApplicationLabel: labelData,
-            kSecReturnRef:            true as CFBoolean
+            kSecClass:              kSecClassKey,
+            kSecValueRef:           privateKey,
+            kSecAttrKeyClass:       kSecAttrKeyClassPrivate,
+            kSecAttrApplicationTag: tagData,
+            kSecReturnRef:          true as CFBoolean
         ] as CFDictionary, &keyOut)
         guard ks == errSecSuccess || ks == errSecDuplicateItem else {
             NSLog("[PairingTLSExtractor] key SecItemAdd failed: %d", ks)
@@ -248,14 +251,27 @@ struct PairingTLSExtractor {
         }
         NSLog("[PairingTLSExtractor] key imported (status=%d)", ks)
 
-        // 3) Query identity (iOS-only path -- SecIdentityCreateWithCertificate
-        //    does not exist on iOS).
+        // 2) Import CERT second, sharing the same tag.
+        var certOut: CFTypeRef?
+        let cs = SecItemAdd([
+            kSecClass:              kSecClassCertificate,
+            kSecValueRef:           certificate,
+            kSecAttrApplicationTag: tagData,
+            kSecReturnRef:          true as CFBoolean
+        ] as CFDictionary, &certOut)
+        guard cs == errSecSuccess || cs == errSecDuplicateItem else {
+            NSLog("[PairingTLSExtractor] cert SecItemAdd failed: %d", cs)
+            throw PairingTLSError.identityCreationFailed(cs)
+        }
+        NSLog("[PairingTLSExtractor] cert imported (status=%d)", cs)
+
+        // 3) Query identity.
         var idOut: CFTypeRef?
         let q: [CFString: Any] = [
-            kSecClass:                kSecClassIdentity,
-            kSecAttrApplicationLabel: labelData,
-            kSecReturnRef:            true as CFBoolean,
-            kSecMatchLimit:           kSecMatchLimitOne
+            kSecClass:              kSecClassIdentity,
+            kSecAttrApplicationTag: tagData,
+            kSecReturnRef:          true as CFBoolean,
+            kSecMatchLimit:         kSecMatchLimitOne
         ]
         let qs = SecItemCopyMatching(q as CFDictionary, &idOut)
         guard qs == errSecSuccess, let identity = idOut else {
