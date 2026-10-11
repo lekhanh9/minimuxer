@@ -1305,18 +1305,17 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         }
         let exePath = bundlePath.hasSuffix("/") ? bundlePath + exeNameStr : bundlePath + "/" + exeNameStr
         verboseLog("[IdeviceGateway] launchAppPre17() executable path: \(exePath)")
-        // Build A packet manually. The Rust debug_proxy_set_argv implementation
-        // formats the length in DECIMAL via format!("{}", ...) instead of HEX,
-        // which makes debugserver read too much data and close the connection.
-        // GDB RSP A packet spec: A<arglen_hex>,<argnum_hex>,<argdata_hex>
-        // GDB RSP A packet spec: A<total_bytes_hex>,<argc_hex>,<arg0_len_hex>,<arg0_data>,...
-        // (LLDB/GDB format). Previous attempts used wrong arg count and missing arg length.
+        // Build A packet manually.
+        // LLDB/debugserver (RNBRemote.cpp) parses arglen and argnum using
+        // strtoul(buf, &c, 10) -> DECIMAL, not hex. Bug LLDB #42471.
+        // Correct GDB RSP format: A<arglen_dec>,<argnum_dec>,<hexdata>
+        // argnum = 0 for the first (and only) argument: the executable path.
+        // No "argc" field. No separate arg0_len.
         let pathByteCount = exePath.utf8.count
         let hexData = exePath.utf8.map { String(format: "%02x", $0) }.joined()
-        let totalHex = String(pathByteCount, radix: 16)
-        let argLenHex = String(pathByteCount, radix: 16)
-        let aPacket = "A\(totalHex),1,\(argLenHex),\(hexData)"
-        verboseLog("[IdeviceGateway] launchAppPre17() A packet prefix: \(aPacket.prefix(80))")
+        let argLenDec = String(pathByteCount)                 // DECIMAL: "101", not "65"
+        let aPacket = "A\(argLenDec),0,\(hexData)"
+        verboseLog("[IdeviceGateway] launchAppPre17() A packet FULL: \(aPacket)")
         let argvResponse = try self.sendDebugProxyCommand(client: debugProxyClient, name: aPacket, args: [])
         verboseLog("[IdeviceGateway] launchAppPre17() argv response: \(argvResponse ?? "(nil)")")
 
