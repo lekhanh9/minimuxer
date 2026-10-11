@@ -1313,8 +1313,13 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         // No "argc" field. No separate arg0_len.
         let pathByteCount = exePath.utf8.count
         let hexData = exePath.utf8.map { String(format: "%02x", $0) }.joined()
-        let argLenDec = String(pathByteCount)                 // DECIMAL: "101", not "65"
-        let aPacket = "A\(argLenDec),0,\(hexData)"
+        // debugserver (RNBRemote.cpp HandlePacket_A) parses arglen/argnum
+        // with strtol(p, &end, 16) -> HEX, not decimal. Bug lldb #42471
+        // refers to gdbserver, not Apple's debugserver.
+        // Correct format: A<arglen_hex>,<argnum_hex>,<hexdata>
+        // Path 101 bytes -> arglen_hex = "65"
+        let argLenHex = String(pathByteCount, radix: 16)
+        let aPacket = "A\(argLenHex),0,\(hexData)"
         verboseLog("[IdeviceGateway] launchAppPre17() A packet FULL: \(aPacket)")
         let argvResponse = try self.sendDebugProxyCommand(client: debugProxyClient, name: aPacket, args: [])
         verboseLog("[IdeviceGateway] launchAppPre17() argv response: \(argvResponse ?? "(nil)")")
