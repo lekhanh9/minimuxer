@@ -1309,9 +1309,13 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         // formats the length in DECIMAL via format!("{}", ...) instead of HEX,
         // which makes debugserver read too much data and close the connection.
         // GDB RSP A packet spec: A<arglen_hex>,<argnum_hex>,<argdata_hex>
+        // GDB RSP A packet spec: A<total_bytes_hex>,<argc_hex>,<arg0_len_hex>,<arg0_data>,...
+        // (LLDB/GDB format). Previous attempts used wrong arg count and missing arg length.
+        let pathByteCount = exePath.utf8.count
         let hexData = exePath.utf8.map { String(format: "%02x", $0) }.joined()
-        let lenHex = String(hexData.count, radix: 16)
-        let aPacket = "A\(lenHex),0,\(hexData)"
+        let totalHex = String(pathByteCount, radix: 16)
+        let argLenHex = String(pathByteCount, radix: 16)
+        let aPacket = "A\(totalHex),1,\(argLenHex),\(hexData)"
         verboseLog("[IdeviceGateway] launchAppPre17() A packet prefix: \(aPacket.prefix(80))")
         let argvResponse = try self.sendDebugProxyCommand(client: debugProxyClient, name: aPacket, args: [])
         verboseLog("[IdeviceGateway] launchAppPre17() argv response: \(argvResponse ?? "(nil)")")
