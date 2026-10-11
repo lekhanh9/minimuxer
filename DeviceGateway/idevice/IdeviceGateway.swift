@@ -1305,23 +1305,16 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         }
         let exePath = bundlePath.hasSuffix("/") ? bundlePath + exeNameStr : bundlePath + "/" + exeNameStr
         verboseLog("[IdeviceGateway] launchAppPre17() executable path: \(exePath)")
-        try exePath.withCString { exePtr in
-            var argvptrs: [UnsafePointer<Int8>?] = [exePtr]
-            var response: UnsafeMutablePointer<Int8>? = nil
-            verboseLog("[IdeviceGateway] launchAppPre17() setting argv for \(exePath)")
-            let argvErr = debug_proxy_set_argv(debugProxyClient, &argvptrs, UInt(argvptrs.count), &response)
-            if let argvErr = argvErr {
-                let msg = self.getErrorMessage(from: argvErr)
-                debugLog("[IdeviceGateway] launchAppPre17() debug_proxy_set_argv failed: \(msg)")
-                defer { idevice_error_free(argvErr) }
-                throw IdeviceGatewayError(.serviceError, reason: "Failed to set debug proxy argv, error: (\(msg))")
-            }
-            if let response = response {
-                let respStr = String(cString: response)
-                verboseLog("[IdeviceGateway] launchAppPre17() argv response: \(respStr)")
-                free(response)
-            }
-        }
+        // Build A packet manually. The Rust debug_proxy_set_argv implementation
+        // formats the length in DECIMAL via format!("{}", ...) instead of HEX,
+        // which makes debugserver read too much data and close the connection.
+        // GDB RSP A packet spec: A<arglen_hex>,<argnum_hex>,<argdata_hex>
+        let hexData = exePath.utf8.map { String(format: "%02x", $0) }.joined()
+        let lenHex = String(hexData.count, radix: 16)
+        let aPacket = "A\(lenHex),0,\(hexData)"
+        verboseLog("[IdeviceGateway] launchAppPre17() A packet prefix: \(aPacket.prefix(80))")
+        let argvResponse = try self.sendDebugProxyCommand(client: debugProxyClient, name: aPacket, args: [])
+        verboseLog("[IdeviceGateway] launchAppPre17() argv response: \(argvResponse ?? "(nil)")")
 
         verboseLog("[IdeviceGateway] launchAppPre17() launching application")
         try self.sendDebugProxyCommand(client: debugProxyClient, name: "qLaunchSuccess", args: [])
