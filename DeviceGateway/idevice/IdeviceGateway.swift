@@ -1127,9 +1127,11 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
             // FIX: try DVTSecureSocketProxy first (iOS 13.6+), fallback to legacy.
             // Based on libimobiledevice commit 98056a8.
+            // Try legacy first (no SSL) for TCP direct compatibility.
+            // DVTSecureSocketProxy requires TLS handshake, which plain TCP cannot do.
             let serviceNames = [
-                "com.apple.debugserver.DVTSecureSocketProxy",
-                "com.apple.debugserver"
+                "com.apple.debugserver",
+                "com.apple.debugserver.DVTSecureSocketProxy"
             ]
             var lastStartError: IdeviceGatewayError? = nil
             var started = false

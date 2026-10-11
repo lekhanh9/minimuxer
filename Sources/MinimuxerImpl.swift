@@ -602,6 +602,12 @@ final internal class MinimuxerImpl: MinimuxerAPI {
             }
             
             try await self.gateway.debugApp(appId: appId)
+
+            // FIX: After debugApp finishes, wait for heartbeat to restore
+            // before returning, so EnableJITOperation's isReady() check does
+            // not hit "heartbeat has not succeeded yet" (code 18).
+            await self.heartbeat.start()
+            _ = await self.heartbeat.waitUntilReady(timeout: 8.0)
         }
     }
 
