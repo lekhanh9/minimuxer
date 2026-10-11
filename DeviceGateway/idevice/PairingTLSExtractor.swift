@@ -29,20 +29,74 @@ internal enum PairingTLSExtractor {
         guard let dict = plist as? [String: Any] else {
             throw PairingTLSError.missingField("root dictionary")
         }
-        guard let hostCertData = dict["HostCertificate"] as? Data else {
-            throw PairingTLSError.missingField("HostCertificate")
-        }
-        guard let hostKeyData = dict["HostPrivateKey"] as? Data else {
-            throw PairingTLSError.missingField("HostPrivateKey")
-        }
-        guard let cert = SecCertificateCreateWithData(nil, hostCertData as CFData) else {
+
+        // Debug: log available keys and their types
+        let keysList = dict.keys.sorted().joined(separator: ",")
+        NSLog("[PairingTLSExtractor] plist keys: %@", keysList)
+
+        let hostCertRaw = dict["HostCertificate"]
+        NSLog("[PairingTLSExtractor] HostCertificate type: %@",
+              hostCertRaw.map { String(describing: type(of: $0)) } ?? "nil")
+
+        let hostCertData: Data
+        if let d = hostCertRaw as? Data {
+            hostCertData = d
+        } else if let s = hostCertRaw as? String {
+            if let d = Data(base64Encoded: s) {
+                hostCertData = d
+            } else {
+                // Try PEM strip
+                let stripped = s
+                    .replacingOccurrences(of: "-----BEGIN CERTIFICATE-----", with: "")
+                    .replacingOccurrences(of: "-----END CERTIFICATE-----", with: "")
+                    .replacingOccurrences(of: "\n", with: "")
+                    .replacingOccurrences(of: "\r", with: "")
+                guard let d = Data(base64Encoded: stripped) else {
+                    NSLog("[PairingTLSExtractor] cert string not base64/PEM")
+                    throw PairingTLSError.invalidCertificate
+                }
+                hostCertData = d
+            }
+        } else {
+            NSLog("[PairingTLSExtractor] unsupported HostCertificate type")
             throw PairingTLSError.invalidCertificate
         }
+
+        NSLog("[PairingTLSExtractor] cert size: %d, prefix: %@",
+              hostCertData.count,
+              hostCertData.prefix(8).map { String(format: "%02x", $0) }.joined(separator: " "))
+
+        // If DER X.509 starts with 0x30 0x82, try direct
+        guard let cert = SecCertificateCreateWithData(nil, hostCertData as CFData) else {
+            NSLog("[PairingTLSExtractor] SecCertificateCreateWithData failed")
+            throw PairingTLSError.invalidCertificate
+        }
+
+        let hostKeyRaw = dict["HostPrivateKey"]
+        NSLog("[PairingTLSExtractor] HostPrivateKey type: %@",
+              hostKeyRaw.map { String(describing: type(of: $0)) } ?? "nil")
+
+        let hostKeyData: Data
+        if let d = hostKeyRaw as? Data {
+            hostKeyData = d
+        } else if let s = hostKeyRaw as? String {
+            if let d = Data(base64Encoded: s) {
+                hostKeyData = d
+            } else {
+                throw PairingTLSError.invalidKey("string not base64")
+            }
+        } else {
+            throw PairingTLSError.invalidKey("unsupported type")
+        }
+
+        NSLog("[PairingTLSExtractor] key size: %d, prefix: %@",
+              hostKeyData.count,
+              hostKeyData.prefix(8).map { String(format: "%02x", $0) }.joined(separator: " "))
+
         let key = try createRSAKey(from: hostKeyData)
 
         let tag = "minimuxer.debug.tls".data(using: .utf8)!
 
-        // Clean old items with same tag (idempotent)
         SecItemDelete([
             kSecClass as String: kSecClassKey,
             kSecAttrApplicationTag as String: tag,
@@ -52,7 +106,6 @@ internal enum PairingTLSExtractor {
             kSecAttrApplicationTag as String: tag,
         ] as CFDictionary)
 
-        // Add private key with tag
         let addKeyStatus = SecItemAdd([
             kSecClass as String: kSecClassKey,
             kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
@@ -63,7 +116,6 @@ internal enum PairingTLSExtractor {
             throw PairingTLSError.keychainError(addKeyStatus, "add RSA key")
         }
 
-        // Add certificate with same tag — iOS links cert+key with same tag into identity
         let addCertStatus = SecItemAdd([
             kSecClass as String: kSecClassCertificate,
             kSecAttrApplicationTag as String: tag,
@@ -73,7 +125,6 @@ internal enum PairingTLSExtractor {
             throw PairingTLSError.keychainError(addCertStatus, "add cert")
         }
 
-        // Query identity by applicationTag
         var idResult: CFTypeRef? = nil
         let idStatus = SecItemCopyMatching([
             kSecClass as String: kSecClassIdentity,
