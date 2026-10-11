@@ -1222,7 +1222,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             }
             defer { idevice_pairing_file_free(pf) }
 
-            let sessErr = idevice_start_session(ideviceHandle, pf, false)
+            let sessErr = idevice_start_session(ideviceHandle, pf, true)
             if let sessErr = sessErr {
                 defer { safeFreeError(sessErr) }
                 let msg = self.getErrorMessage(from: sessErr)
