@@ -1335,6 +1335,11 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
         verboseLog("[IdeviceGateway] launchAppPre17() launching application")
         try self.sendDebugProxyCommand(client: debugProxyClient, name: "qLaunchSuccess", args: [])
+        // PATCH: continue app after launch, but DO NOT detach.
+        // Without "c" the app stays stopped at entry and user sees nothing.
+        // With "D" the app runs but kernel clears CS_DEBUGGED -> no JIT.
+        // "c" = run while keeping debugserver attached -> JIT alive.
+        _ = try? self.sendDebugProxyCommand(client: debugProxyClient, name: "c", args: [])
         // PATCH: do NOT send D here - keep debugserver attached so
         // kernel keeps CS_DEBUGGED on the target process. Detach only
         // happens in disableJIT().
