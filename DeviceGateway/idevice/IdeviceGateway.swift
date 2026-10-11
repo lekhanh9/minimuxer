@@ -1299,7 +1299,10 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         try self.sendDebugProxyCommand(client: debugProxyClient, name: "QSetMaxPacketSize", args: ["\(MinimuxerConstants.maxPacketSize)"])
         try self.sendDebugProxyCommand(client: debugProxyClient, name: "QSetWorkingDir", args: [container])
 
-        let exePath = bundlePath.hasSuffix("/") ? bundlePath + exeName : bundlePath + "/" + exeName
+        guard let bundlePathStr = bundlePath, let exeNameStr = exeName else {
+            throw IdeviceGatewayError(.serviceError, reason: "getAppPaths returned nil bundlePath or exeName for \(appId)")
+        }
+        let exePath = bundlePathStr.hasSuffix("/") ? bundlePathStr + exeNameStr : bundlePathStr + "/" + exeNameStr
         verboseLog("[IdeviceGateway] launchAppPre17() executable path: \(exePath)")
         try exePath.withCString { exePtr in
             var argvptrs: [UnsafePointer<Int8>?] = [exePtr]
