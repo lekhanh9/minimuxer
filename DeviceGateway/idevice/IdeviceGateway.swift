@@ -2515,7 +2515,7 @@ extension IdeviceGateway {
         // iOS 16+), connectDebugProxy transparently performs the TLS handshake
         // via idevice_start_session using the pairing host identity.
         self.isDebugActive = true
-        defer { self.isDebugActive = false }
+        // PATCH: isDebugActive stays true whole session; reset in disableJIT only.
         try await withFFIDispatch {
             try self.syncDebugApp(appId: appId)
         }
