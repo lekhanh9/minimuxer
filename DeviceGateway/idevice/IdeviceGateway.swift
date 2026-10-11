@@ -42,7 +42,9 @@ internal func isTransportErrorText(_ text: String) -> Bool {
 
 internal func isTransportError(_ error: Error) -> Bool {
     if let e = error as? DeviceGatewayError {
-        return isTransportErrorText(e.reason)
+        if isTransportErrorText(e.reason) {
+            return true
+        }
     }
     return isTransportErrorText("\(error)") || isTransportErrorText(error.localizedDescription)
 }
@@ -58,6 +60,7 @@ extension String {
 
 public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @unchecked Sendable {
     public static let shared = IdeviceGateway()
+    private static let detachAfterLaunch: Bool = true
     public let requiresUsbmuxd: Bool = false
     var lastError: Error? = nil
 
@@ -102,6 +105,10 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     private var activeDebugClient: OpaquePointer?
     private var adapter: OpaquePointer? = nil
     private var handshake: OpaquePointer? = nil
+
+    // Serializes TCP lockdown service sessions to prevent concurrent connection
+    // thrashing and TLS session drops on iOS lockdown services (port 62078).
+    private let lockdownLock = NSRecursiveLock()
 
     public override init() {
         try! super.init()
@@ -583,6 +590,9 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         serviceName: String,
         action: (OpaquePointer) throws -> T
     ) throws -> T {
+        lockdownLock.lock()
+        defer { lockdownLock.unlock() }
+
         let maxAttempts = 3
         var attempt = 0
         while true {
@@ -858,6 +868,9 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             }
  
             let path = "\(bundleDir)/app.ipa"
+            _ = path.withCString { pathPtr in
+                afc_remove_path(client, pathPtr)
+            }
             var fileHandle: OpaquePointer? = nil
             verboseLog("[IdeviceGateway] sendIpaAfc() opening remote file: \(path)")
             let openErr = path.withCString { pathPtr in
@@ -1358,59 +1371,52 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         }
 
         verboseLog("[IdeviceGateway] launchAppPre17() configuring debug proxy workspace")
-        try self.sendDebugProxyCommand(client: debugProxyClient, name: "QSetMaxPacketSize", args: ["\(MinimuxerConstants.maxPacketSize)"])
-        try self.sendDebugProxyCommand(client: debugProxyClient, name: "QSetWorkingDir", args: [container])
+        try self.sendDebugProxyCommand(client: debugProxyClient, name: "QSetMaxPacketSize:", args: ["\(MinimuxerConstants.maxPacketSize)"])
+        try self.sendDebugProxyCommand(client: debugProxyClient, name: "QSetWorkingDir:", args: [container])
 
         guard let exeNameStr = exeName else {
             throw IdeviceGatewayError(.serviceError, reason: "getAppPaths returned nil exeName for \(appId)")
         }
         let exePath = bundlePath.hasSuffix("/") ? bundlePath + exeNameStr : bundlePath + "/" + exeNameStr
         verboseLog("[IdeviceGateway] launchAppPre17() executable path: \(exePath)")
-        // Build A packet manually.
-        // LLDB/debugserver (RNBRemote.cpp) parses arglen and argnum using
-        // strtoul(buf, &c, 10) -> DECIMAL, not hex. Bug LLDB #42471.
-        // Correct GDB RSP format: A<arglen_dec>,<argnum_dec>,<hexdata>
-        // argnum = 0 for the first (and only) argument: the executable path.
-        // No "argc" field. No separate arg0_len.
-        // GDB RSP handshake: negotiate + disable ack mode BEFORE A packet.
-        // StikJIT/StikDebug send qSupported and QStartNoAckMode first.
-        let qSup = try? self.sendDebugProxyCommand(client: debugProxyClient, name: "qSupported", args: ["multiprocess+"])
-        verboseLog("[IdeviceGateway] launchAppPre17() qSupported resp: \(qSup ?? "(nil)")")
-        // PATCH: do NOT send QStartNoAckMode. Rust FFI wrapper does not
-        // send the final ack after OK, leaving the connection stuck
-        // waiting for ack. All subsequent packets (A/qLaunchSuccess/c)
-        // get no reply. Stay in ack mode - the wrapper handles acks.
 
-        // FIX: arglen is the length of the HEX-ENCODED argument (number of hex characters),
-        // parsed as decimal by debugserver (same as idevice: arg.len() * 2).
-        // The old code sent the BYTE count (+1) -> 102 for a 101 byte path, while the hex payload
-        // was 204 chars. debugserver only read the first 102 hex chars (51 bytes), so the path was
-        // truncated to ".../Application/6D10B8BB" and launch failed with
-        // "ENo such file or directory (.../6D10B8BB)".
-        let aHex = exePath.utf8.map { String(format: "%02x", $0) }.joined() + "00"   // + NUL terminator
+        // Build A packet manually.
+        // LLDB/debugserver (RNBRemote.cpp HandlePacket_A) parses arglen and argnum with:
+        // strtoul(buf, &c, 10) -> DECIMAL number of HEX characters.
+        // argnum = 0 for the first (and only) argument: the executable path.
+        // Includes trailing NUL (00) byte in the hex payload.
+        // DO NOT send QStartNoAckMode: Stay in standard GDB RSP ACK mode.
+        // Rust FFI (jkcoxson/idevice) handles '+' ACK framing automatically on every packet.
+        let aHex = exePath.utf8.map { String(format: "%02x", $0) }.joined() + "00"
         let aPacket = "A\(aHex.count),0,\(aHex)"
-        verboseLog("[IdeviceGateway] launchAppPre17() A packet FULL: \(aPacket)")
+        debugLog("[IdeviceGateway] launchAppPre17() A packet FULL: \(aPacket)")
         let argvResponse = try self.sendDebugProxyCommand(client: debugProxyClient, name: aPacket, args: [])
-        verboseLog("[IdeviceGateway] launchAppPre17() argv response: \(argvResponse ?? "(nil)")")
+        debugLog("[IdeviceGateway] launchAppPre17() argv response: \(argvResponse ?? "(nil)")")
         if let r = argvResponse, r.hasPrefix("E") {
             throw IdeviceGatewayError(.serviceError, reason: "debugserver rejected argv (A packet): \(r)")
         }
 
-        verboseLog("[IdeviceGateway] launchAppPre17() launching application")
+        debugLog("[IdeviceGateway] launchAppPre17() launching application")
         let launchResponse = try self.sendDebugProxyCommand(client: debugProxyClient, name: "qLaunchSuccess", args: [])
+        debugLog("[IdeviceGateway] launchAppPre17() qLaunchSuccess response: \(launchResponse ?? "(nil)")")
         if let r = launchResponse, r.hasPrefix("E") {
             throw IdeviceGatewayError(.serviceError, reason: "debugserver failed to launch app: \(r)")
         }
-        // PATCH: continue app after launch, but DO NOT detach.
-        // Without "c" the app stays stopped at entry and user sees nothing.
-        // With "D" the app runs but kernel clears CS_DEBUGGED -> no JIT.
-        // "c" = run while keeping debugserver attached -> JIT alive.
-        _ = try? self.sendDebugProxyCommand(client: debugProxyClient, name: "c", args: [])
-        // PATCH: do NOT send D here - keep debugserver attached so
-        // kernel keeps CS_DEBUGGED on the target process. Detach only
-        // happens in disableJIT().
-        launchSucceeded = true
-        debugLog("[IdeviceGateway] launchAppPre17() app launched successfully")
+
+        if Self.detachAfterLaunch {
+            let detachResponse = try? self.sendDebugProxyCommand(client: debugProxyClient, name: "D", args: [])
+            debugLog("[IdeviceGateway] launchAppPre17() detach response: \(detachResponse ?? "(nil)") - closing debug session")
+            Thread.sleep(forTimeInterval: 0.2)
+            debug_proxy_free(debugProxyClient)
+            self.activeDebugClient = nil
+            self.isDebugActive = false
+            launchSucceeded = true
+            debugLog("[IdeviceGateway] launchAppPre17() app launched and detached successfully")
+        } else {
+            _ = try? self.sendDebugProxyCommand(client: debugProxyClient, name: "c", args: [])
+            launchSucceeded = true
+            debugLog("[IdeviceGateway] launchAppPre17() app launched successfully")
+        }
     }
 
     private func syncDebugApp(appId: String) throws {
@@ -1538,6 +1544,15 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
            newInterval.pointee = interval
            return
        }
+       // If another lockdown service operation is active, skip heartbeat so we do not
+       // disrupt an in-flight transfer, mount, or install on port 62078.
+       guard lockdownLock.try() else {
+           verboseLog("[IdeviceGateway] performHeartbeat() skipped (gateway busy with another operation)")
+           newInterval.pointee = interval
+           return
+       }
+       defer { lockdownLock.unlock() }
+
        try verifyInitialized()
        try performWithEitherService(
            connectRP: heartbeat_connect_rsd,
@@ -1807,18 +1822,28 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             cleanup: image_mounter_free,
             serviceName: "image mounter"
         ) { client in
-            // Personalized DDI (iOS 17+)
-            if try isDeveloperDiskImageMounted(mounterClient: client) {
-                debugLog("[IdeviceGateway] isDDIMounted() personalized DDI is mounted")
-                return true
+            if self.pairingFileType == .lockdown {
+                // Classic Developer DDI (iOS 16 and below)
+                if try self.isLegacyDeveloperImageMounted(mounterClient: client) {
+                    debugLog("[IdeviceGateway] isDDIMounted() legacy Developer DDI is mounted")
+                    return true
+                }
+                debugLog("[IdeviceGateway] isDDIMounted() no DDI is mounted")
+                return false
+            } else {
+                // Personalized DDI (iOS 17+)
+                if try self.isDeveloperDiskImageMounted(mounterClient: client) {
+                    debugLog("[IdeviceGateway] isDDIMounted() personalized DDI is mounted")
+                    return true
+                }
+                // Classic Developer DDI fallback
+                if try self.isLegacyDeveloperImageMounted(mounterClient: client) {
+                    debugLog("[IdeviceGateway] isDDIMounted() legacy Developer DDI is mounted")
+                    return true
+                }
+                debugLog("[IdeviceGateway] isDDIMounted() no DDI is mounted")
+                return false
             }
-            // Classic Developer DDI (iOS 16 and below)
-            if try isLegacyDeveloperImageMounted(mounterClient: client) {
-                debugLog("[IdeviceGateway] isDDIMounted() legacy Developer DDI is mounted")
-                return true
-            }
-            debugLog("[IdeviceGateway] isDDIMounted() no DDI is mounted")
-            return false
         }
     }
 
@@ -2612,14 +2637,11 @@ extension IdeviceGateway {
         // iOS 16+), connectDebugProxy transparently performs the TLS handshake
         // via idevice_start_session using the pairing host identity.
         self.isDebugActive = true
-        // PATCH: isDebugActive stays true whole session; reset in disableJIT only.
         do {
             try await withFFIDispatch {
                 try self.syncDebugApp(appId: appId)
             }
         } catch {
-            // FIX: a failed attempt must not leave "debug active" set, otherwise heartbeats
-            // stay skipped forever and the device drops our services.
             self.isDebugActive = false
             throw error
         }
