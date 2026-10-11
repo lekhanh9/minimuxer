@@ -1159,83 +1159,64 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     }
 
     private func connectDebugProxy(port: UInt16) throws -> OpaquePointer {
-        var addr: OpaquePointer? = nil
-        let addrErr = idevice_usbmuxd_default_addr_new(&addr)
-        if let addrErr = addrErr {
-            debugLog("[IdeviceGateway] connectDebugProxy default_addr_new failed")
-            defer { idevice_error_free(addrErr) }
-            throw IdeviceGatewayError(.connectionFailed, reason: "Failed to get usbmuxd default addr")
-        }
-        guard let addr = addr else {
-            throw IdeviceGatewayError(.connectionFailed, reason: "Usbmuxd default addr was nil")
-        }
-        defer { idevice_usbmuxd_addr_free(addr) }
+        debugLog("[IdeviceGateway] connectDebugProxy(port: \(port)) - TCP direct path")
 
-        var conn: OpaquePointer? = nil
-        let connErr = idevice_usbmuxd_new_default_connection(0, &conn)
+        guard let deviceIp = deviceEndpointIp else {
+            throw IdeviceGatewayError(.deviceEndpointIpNotAvailable)
+        }
+
+        // STEP 1: TCP connect via idevice_new_tcp_socket (plain TCP, no TLS)
+        var ideviceHandle: OpaquePointer? = nil
+        let connErr = try withSockaddr(ip: deviceIp, port: port) { sockaddrPtr, sockaddrLen in
+            sockaddrPtr.withMemoryRebound(to: idevice_sockaddr.self, capacity: 1) { reboundPtr in
+                idevice_new_tcp_socket(
+                    reboundPtr,
+                    sockaddrLen,
+                    MinimuxerConstants.appName,
+                    &ideviceHandle
+                )
+            }
+        }
         if let connErr = connErr {
-            debugLog("[IdeviceGateway] connectDebugProxy new_default_connection failed")
-            defer { idevice_error_free(connErr) }
-            throw IdeviceGatewayError(.connectionFailed, reason: "Failed to create usbmuxd connection")
+            let msg = self.getErrorMessage(from: connErr)
+            debugLog("[IdeviceGateway] idevice_new_tcp_socket failed: \(msg)")
+            defer { safeFreeError(connErr) }
+            throw IdeviceGatewayError(.connectionFailed, reason: "TCP connect to \(deviceIp):\(port) failed: \(msg)")
         }
-        guard let conn = conn else {
-            throw IdeviceGatewayError(.connectionFailed, reason: "Usbmuxd connection was nil")
+        guard let ideviceHandle = ideviceHandle else {
+            throw IdeviceGatewayError(.connectionFailed, reason: "ideviceHandle was nil")
         }
-        defer { idevice_usbmuxd_connection_free(conn) }
+        debugLog("[IdeviceGateway] TCP connected to \(deviceIp):\(port)")
 
-        var devices: UnsafeMutablePointer<OpaquePointer?>? = nil
-        var count: Int32 = 0
-        let devErr = idevice_usbmuxd_get_devices(conn, &devices, &count)
-        if let devErr = devErr {
-            debugLog("[IdeviceGateway] connectDebugProxy get_devices failed")
-            defer { idevice_error_free(devErr) }
-            throw IdeviceGatewayError(.connectionFailed, reason: "Failed to list usbmuxd devices")
-        }
-        guard count > 0, let devicesPtr = devices, let firstDev = devicesPtr.pointee else {
-            throw IdeviceGatewayError(.connectionFailed, reason: "No devices found on usbmuxd")
-        }
-        defer { idevice_usbmuxd_device_list_free(devices, count) }
-
-        let deviceID = idevice_usbmuxd_device_get_device_id(firstDev)
-        var debugDevice: OpaquePointer? = nil
-        let connectErr = "minimuxer-debug".withCString { labelPtr in
-            idevice_usbmuxd_connect_to_device(conn, deviceID, port, labelPtr, &debugDevice)
-        }
-        if let connectErr = connectErr {
-            debugLog("[IdeviceGateway] connectDebugProxy connect_to_device failed")
-            defer { idevice_error_free(connectErr) }
-            throw IdeviceGatewayError(.connectionFailed, reason: "Failed to connect to debugserver port \(port)")
-        }
-        guard let debugDevice = debugDevice else {
-            throw IdeviceGatewayError(.connectionFailed, reason: "Debug device handle was nil")
-        }
-        defer { idevice_free(debugDevice) }
-
+        // STEP 2: Convert handle -> ReadWriteOpaque stream (CONSUMES handle)
         var stream: OpaquePointer? = nil
-        let streamErr = idevice_to_stream(debugDevice, &stream)
+        let streamErr = idevice_to_stream(ideviceHandle, &stream)
         if let streamErr = streamErr {
-            debugLog("[IdeviceGateway] connectDebugProxy idevice_to_stream failed")
-            defer { idevice_error_free(streamErr) }
-            throw IdeviceGatewayError(.serviceError, reason: "Failed to convert device connection to stream")
+            let msg = self.getErrorMessage(from: streamErr)
+            debugLog("[IdeviceGateway] idevice_to_stream failed: \(msg)")
+            defer { safeFreeError(streamErr) }
+            throw IdeviceGatewayError(.serviceError, reason: "idevice_to_stream failed: \(msg)")
         }
         guard let stream = stream else {
-            throw IdeviceGatewayError(.serviceError, reason: "Stream was nil")
+            throw IdeviceGatewayError(.serviceError, reason: "stream was nil")
         }
+        debugLog("[IdeviceGateway] idevice_to_stream succeeded")
 
-        var debugProxyClient: OpaquePointer? = nil
-        let proxyErr = debug_proxy_new(stream, &debugProxyClient)
+        // STEP 3: Wrap stream -> DebugProxyClient (CONSUMES stream)
+        var client: OpaquePointer? = nil
+        let proxyErr = debug_proxy_new(stream, &client)
         if let proxyErr = proxyErr {
             let msg = self.getErrorMessage(from: proxyErr)
-            debugLog("[IdeviceGateway] connectDebugProxy debug_proxy_new failed: \(msg)")
-            defer { idevice_error_free(proxyErr) }
-            idevice_stream_free(stream)
-            throw IdeviceGatewayError(.serviceError, reason: "Failed to create debug proxy client, error: (\(msg))")
+            debugLog("[IdeviceGateway] debug_proxy_new failed: \(msg)")
+            defer { safeFreeError(proxyErr) }
+            throw IdeviceGatewayError(.serviceError, reason: "debug_proxy_new failed: \(msg)")
         }
-        guard let debugProxyClient = debugProxyClient else {
-            idevice_stream_free(stream)
-            throw IdeviceGatewayError(.serviceError, reason: "Debug proxy client was nil")
+        guard let client = client else {
+            throw IdeviceGatewayError(.serviceError, reason: "debug proxy client was nil")
         }
-        return debugProxyClient
+
+        debugLog("[IdeviceGateway] connectDebugProxy SUCCESS via TCP direct on port \(port)")
+        return client
     }
 
     private func launchAppPre17(appId: String) throws {
