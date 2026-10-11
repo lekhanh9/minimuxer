@@ -75,6 +75,8 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     private var pairingFile: OpaquePointer? = nil
     private var lastDebugserverNeedsSSL: Bool = false
     private var isDebugActive: Bool = false
+    // PATCH: hold reference to debug_proxy client so it survives debugApp() return
+    private var activeDebugClient: OpaquePointer?
     private var adapter: OpaquePointer? = nil
     private var handshake: OpaquePointer? = nil
 
@@ -1294,7 +1296,9 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         }
 
         let debugProxyClient = try connectDebugProxy(port: port)
-        defer { debug_proxy_free(debugProxyClient) }
+        // PATCH: keep client alive for whole debug session. Do NOT free here.
+        // Reset via disableJIT(appId:).
+        self.activeDebugClient = debugProxyClient
 
         verboseLog("[IdeviceGateway] launchAppPre17() configuring debug proxy workspace")
         try self.sendDebugProxyCommand(client: debugProxyClient, name: "QSetMaxPacketSize", args: ["\(MinimuxerConstants.maxPacketSize)"])
@@ -2623,5 +2627,19 @@ extension IdeviceGateway {
         try await withFFIDispatch {
             try self.syncWipeContainer(identifier: identifier)
         }
+    }
+
+    /// PATCH: explicitly send "D" and free debug_proxy client.
+    /// Called when user disables JIT for an app.
+    func disableJIT(appId: String) async {
+        guard let client = self.activeDebugClient else {
+            self.isDebugActive = false
+            return
+        }
+        _ = try? self.sendDebugProxyCommand(client: client, name: "D", args: [])
+        debug_proxy_free(client)
+        self.activeDebugClient = nil
+        self.isDebugActive = false
+        NSLog("[IdeviceGateway] disableJIT called for \(appId) - client freed")
     }
 }
