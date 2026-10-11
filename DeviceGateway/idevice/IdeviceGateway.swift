@@ -1321,8 +1321,10 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         // StikJIT/StikDebug send qSupported and QStartNoAckMode first.
         let qSup = try? self.sendDebugProxyCommand(client: debugProxyClient, name: "qSupported", args: ["multiprocess+"])
         verboseLog("[IdeviceGateway] launchAppPre17() qSupported resp: \(qSup ?? "(nil)")")
-        let noAck = try? self.sendDebugProxyCommand(client: debugProxyClient, name: "QStartNoAckMode", args: [])
-        verboseLog("[IdeviceGateway] launchAppPre17() QStartNoAckMode resp: \(noAck ?? "(nil)")")
+        // PATCH: do NOT send QStartNoAckMode. Rust FFI wrapper does not
+        // send the final ack after OK, leaving the connection stuck
+        // waiting for ack. All subsequent packets (A/qLaunchSuccess/c)
+        // get no reply. Stay in ack mode - the wrapper handles acks.
 
         // debugserver parses arglen via strtoul(..., 10) -> DECIMAL.
         // Include NUL terminator: arglen = pathBytes + 1, hexData ends with "00".
