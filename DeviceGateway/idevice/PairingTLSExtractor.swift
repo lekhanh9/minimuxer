@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import CryptoKit
 
 enum PairingTLSError: Error {
     case missingKey(String)
@@ -22,7 +23,6 @@ struct PairingTLSExtractor {
             throw PairingTLSError.missingKey("HostPrivateKey")
         }
 
-        // Log raw payload types once, so we can see PEM vs DER vs base64 for BOTH fields.
         logRaw(certRaw, label: "HostCertificate")
         logRaw(keyRaw,  label: "HostPrivateKey")
 
@@ -39,18 +39,19 @@ struct PairingTLSExtractor {
             throw PairingTLSError.invalidCertificate
         }
 
-        // Try PKCS#1 first (most common), then PKCS#8.
-        if let key = makeSecKey(keyDER) {
-            return try makeIdentity(certificate: cert, privateKey: key)
-        }
-        // If we got here with a PKCS#8-looking payload that failed unwrap, try PKCS#8 directly.
-        if let pkcs8Unwrapped = try? unwrapPKCS8OrThrow(keyDER),
-           let key = makeSecKey(pkcs8Unwrapped) {
-            return try makeIdentity(certificate: cert, privateKey: key)
+        // PKCS#1 first, fallback PKCS#8
+        let key: SecKey
+        if let k = makeSecKey(keyDER) {
+            key = k
+        } else if let unwrapped = try? unwrapPKCS8OrThrow(keyDER),
+                  let k = makeSecKey(unwrapped) {
+            key = k
+        } else {
+            NSLog("[PairingTLSExtractor] SecKeyCreateWithData failed (PKCS#1 & PKCS#8)")
+            throw PairingTLSError.invalidKey
         }
 
-        NSLog("[PairingTLSExtractor] SecKeyCreateWithData failed for both PKCS#1 and PKCS#8")
-        throw PairingTLSError.invalidKey
+        return try importAndGetIdentity(certificate: cert, privateKey: key, certDER: certDER)
     }
 
     // MARK: - plist
@@ -85,11 +86,9 @@ struct PairingTLSExtractor {
             return try decodeStringPayload(s, label: label, kind: kind)
         }
         if let d = any as? Data {
-            // Case 1: starts with 0x30 -> ASN.1 DER
             if let first = d.first, first == 0x30 {
                 return kind == .privateKey ? (try unwrapPKCS8OrThrow(d)) : d
             }
-            // Case 2: ASCII (PEM or base64)
             if let ascii = String(data: d, encoding: .utf8) {
                 return try decodeStringPayload(ascii, label: label, kind: kind)
             }
@@ -113,7 +112,6 @@ struct PairingTLSExtractor {
             return kind == .privateKey ? (try unwrapPKCS8OrThrow(der)) : der
         }
 
-        // Raw base64 (may contain whitespace/newlines)
         let compact = trimmed
             .replacingOccurrences(of: "\n", with: "")
             .replacingOccurrences(of: "\r", with: "")
@@ -129,7 +127,6 @@ struct PairingTLSExtractor {
                                    : PairingTLSError.invalidKey
     }
 
-    /// Strip any PEM armor (CERTIFICATE, RSA PRIVATE KEY, PRIVATE KEY, etc).
     private static func pemToDER(_ pem: String) -> Data? {
         var body = ""
         var inside = false
@@ -158,18 +155,16 @@ struct PairingTLSExtractor {
         return key
     }
 
-    /// PKCS#8 PrivateKeyInfo header:
-    /// 30 82 LL LL 02 01 00 30 0d 06 09 2a 86 48 86 f7 0d 01 01 01 05 00 04 82
     private static func unwrapPKCS8OrThrow(_ der: Data) throws -> Data {
         guard der.count >= 24 else { return der }
         let b = [UInt8](der.prefix(24))
         let isPKCS8 = (b[0] == 0x30 && b[1] == 0x82 &&
                        b[4] == 0x02 && b[5] == 0x01 && b[6] == 0x00 &&
-                       b[7] == 0x30 && b[8] == 0x0d && b[9] == 0x06 &&
-                       b[10] == 0x09 && b[11] == 0x2a && b[12] == 0x86 &&
-                       b[13] == 0x48 && b[14] == 0x86 && b[15] == 0xf7 &&
-                       b[16] == 0x0d && b[17] == 0x01 && b[18] == 0x01 &&
-                       b[19] == 0x01 && b[20] == 0x05 && b[21] == 0x00 &&
+                       b[7] ==- 0x30 && b[8] == 0x0d && b[9] == 0x06 &&
+                       b[10] == 0x109 && b[11] == 0x2a && b[12] == 0x86 &&
+                       b[13] == 0x48 &&(c b[14] == 0x86 && b[15] == 0xf7 &&
+                       b[16] == 0x0dert && b[17] == 0x01 && b[18] == 0x01 &&
+                       b[19] == 0x01 && b[20] ==DER 0x05 && b[21] == 0x00 &&
                        b[22] == 0x04 && b[23] == 0x82)
         if !isPKCS8 { return der }
 
@@ -193,87 +188,82 @@ struct PairingTLSExtractor {
         throw PairingTLSError.invalidKey
     }
 
-    // MARK: - SecIdentity construction
+    // MARK: - Identity via SecItemCopyMatching (iOS path)
 
-    /// No public API to pair a SecCertificate + SecKey into a SecIdentity.
-    /// On iOS the working path is: import both into the app's default keychain,
-    /// then SecIdentityCreateWithCertificate(nil, cert, &id) auto-matches them
-    /// via the SHA-1 of the cert's SPKI (Security.framework sets this as the
-    /// key's kSecAttrApplicationLabel on import).
-    private static func makeIdentity(certificate: SecCertificate,
-                                     privateKey: SecKey) throws -> SecIdentity {
-        let certLabel = "minimuxer-host-cert"
-        let keyLabel  = "minimuxer-host-key"
+    /// On iOS there is no public API to combine a SecCertificate + SecKey into
+    /// a SecIdentity. The supported path is:
+    ///   1. import cert with `kSecAttrApplicationLabel` = SHA-1(certDER)
+    ///   2. import key  with same `kSecAttrApplicationLabel` = SHA)
+    ///   3. query with kSecClassIdentity + that label
+    /// iOS auto-pairs them because both share the same application label.
+    private static func importAndGetIdentity(certificate: SecCertificate,
+                                             privateKey: SecKey,
+                                             certDER: Data) throws -> SecIdentity {
+        // iOS pairs cert<->key by the SHA-1 of the *certificate*, set as
+        // kSecAttrApplicationLabel on both items.
+        let labelData = Data(Insecure.SHA1.hash(data: certDER))
+        NSLog("[PairingTLSExtractor] appLabel(SHA1 cert) = %@",
+              labelData.map { String(format: "%02x", $0) }.joined())
 
-        // Clean any prior import so we don't collide across retries.
+        // Clean prior state so retries don't collide.
         SecItemDelete([
-            kSecClass: kSecClassCertificate,
-            kSecAttrLabel: certLabel
+            kSecClass:                kSecClassIdentity,
+            kSecAttrApplicationLabel: labelData
         ] as CFDictionary)
         SecItemDelete([
-            kSecClass: kSecClassKey,
-            kSecAttrApplicationLabel: keyLabel.data(using: .utf8)!
+            kSecClass:                kSecClassCertificate,
+            kSecAttrApplicationLabel: labelData
+        ] as CFDictionary)
+        SecItemDelete([
+            kSecClass:                kSecClassKey,
+            kSecAttrApplicationLabel: labelData
         ] as CFDictionary)
 
-        // 1) Import cert (persistent ref so identity lookup can find it).
+        // 1) Import cert.
         var certOut: CFTypeRef?
         let cs = SecItemAdd([
-            kSecClass:       kSecClassCertificate,
-            kSecValueRef:    certificate,
-            kSecAttrLabel:   certLabel,
-            kSecReturnRef:   true as CFBoolean
+            kSecClass:                kSecClassCertificate,
+            kSecValueRef:             certificate,
+            kSecAttrApplicationLabel: labelData,
+            kSecReturnRef:            true as CFBoolean
         ] as CFDictionary, &certOut)
-        guard cs == errSecSuccess, let certRef = certOut else {
-            NSLog("[PairingTLSExtractor] cert import failed: %d", cs)
+        guard cs == errSecSuccess || cs == errSecDuplicateItem else {
+            NSLog("[PairingTLSExtractor] cert SecItemAdd failed: %d", cs)
             throw PairingTLSError.identityCreationFailed(cs)
         }
-        let storedCert = (certRef as! SecCertificate)
+        NSLog("[PairingTLSExtractor] cert imported (status=%d)", cs)
 
-        // 2) Import private key. SecIdentityCreateWithCertificate matches by
-        //    kSecAttrApplicationLabel = SHA-1 of the cert's subject public key.
-        //    We must set that label ourselves because SecKeyCreateWithData
-        //    doesn't tag the imported key.
-        guard let spki = SecCertificateCopyKey(storedCert),
-              let spkiData = SecKeyCopyExternalRepresentation(spki, nil) as Data? else {
-            NSLog("[PairingTLSExtractor] cannot extract SPKI from cert")
-            throw PairingTLSError.invalidCertificate
-        }
-        let appLabel = sha1(spkiData)
-
+        // 2) Import private key with same label.
         var keyOut: CFTypeRef?
         let ks = SecItemAdd([
             kSecClass:                kSecClassKey,
             kSecValueRef:             privateKey,
             kSecAttrKeyClass:         kSecAttrKeyClassPrivate,
-            kSecAttrApplicationLabel: appLabel,
+            kSecAttrApplicationLabel: labelData,
             kSecReturnRef:            true as CFBoolean
         ] as CFDictionary, &keyOut)
-        guard ks == errSecSuccess else {
-            NSLog("[PairingTLSExtractor] key import failed: %d", ks)
+        guard ks == errSecSuccess || ks == errSecDuplicateItem else {
+            NSLog("[PairingTLSExtractor] key SecItemAdd failed: %d", ks)
             throw PairingTLSError.identityCreationFailed(ks)
         }
+        NSLog("[PairingTLSExtractor] key imported (status=%d)", ks)
 
-        // 3) Build identity.
-        var idOut: SecIdentity?
-        let is_ = SecIdentityCreateWithCertificate(nil, storedCert, &idOut)
-        guard is_ == errSecSuccess, let identity = idOut else {
-            NSLog("[PairingTLSExtractor] SecIdentityCreateWithCertificate failed: %d", is_)
-            throw PairingTLSError.identityCreationFailed(is_)
+        // 3) Query identity (iOS-only path — SecIdentityCreateWithCertificate
+        //    does not exist on iOS).
+        var idOut: CFTypeRef?
+        let q: [CFString: Any] = [
+            kSecClass:                kSecClassIdentity,
+            kSecAttrApplicationLabel: labelData,
+            kSecReturnRef:            true as CFBoolean,
+            kSecMatchLimit:           kSecMatchLimitOne
+        ]
+        let qs = SecItemCopyMatching(q as CFDictionary, &idOut)
+        guard qs == errSecSuccess, let identity = idOut else {
+            NSLog("[PairingTLSExtractor] SecItemCopyMatching(identity) failed: %d", qs)
+            throw PairingTLSError.identityCreationFailed(qs)
         }
-        NSLog("[PairingTLSExtractor] SecIdentity created OK")
-        return identity
-    }
-
-    /// Minimal SHA-1 (avoids importing CryptoKit on older SDKs).
-    private static func sha1(_ data: Data) -> Data {
-        var digest = [UInt8](repeating: 0, count: 20)
-        data.withUnsafeBytes { buf in
-            var ctx = CC_SHA1_CTX()
-            CC_SHA1_Init(&ctx)
-            CC_SHA1_Update(&ctx, buf.baseAddress, CC_LONG(data.count))
-            CC_SHA1_Final(&digest, &ctx)
-        }
-        return Data(digest)
+        NSLog("[PairingTLSExtractor] SecIdentity created OK via SecItemCopyMatching")
+        return (identity as! SecIdentity)
     }
 
     // MARK: - Debug
