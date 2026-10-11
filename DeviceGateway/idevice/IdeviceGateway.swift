@@ -2446,7 +2446,54 @@ extension IdeviceGateway {
         }
     }
 
+    // MARK: - TLS debug path for iOS 16 lockdown (requires pairing cert+key as mTLS client identity)
+    private func debugAppTLSPre17(appId: String) async throws {
+        debugLog("[IdeviceGateway] debugAppTLSPre17() called for appId: \(appId)")
+
+        let (container, bundlePath, _) = try getAppPaths(appId: appId)
+
+        // Let lockdownd session settle
+        try? await Task.sleep(nanoseconds: 400_000_000)
+
+        let port = try startDebugserverService()
+        debugLog("[IdeviceGateway] debugAppTLSPre17() debugserver port: \(port)")
+
+        guard let pairingData = self.pairingFileData else {
+            throw IdeviceGatewayError(.invalidPairingFile, reason: "pairingFileData nil")
+        }
+        let identity = try PairingTLSExtractor.extractIdentity(from: pairingData)
+
+        guard let deviceIp = deviceEndpointIp else {
+            throw IdeviceGatewayError(.deviceEndpointIpNotAvailable)
+        }
+
+        let tls = try DebugProxyTLS(host: deviceIp, port: port, identity: identity)
+        try await tls.startAndWaitReady(timeout: 5.0)
+        debugLog("[IdeviceGateway] debugAppTLSPre17() TLS handshake OK")
+        defer { tls.close() }
+
+        _ = try await tls.sendGDBCommand("QSetMaxPacketSize:1024")
+        _ = try await tls.sendGDBCommand("QSetWorkingDir:\(container)")
+
+        // argv A packet: A<total_bytes_hex>,<arg_num_hex>,<arg_bytes_hex>,<hex_bytes>,...
+        let argHex = bundlePath.utf8.map { String(format: "%02x", $0) }.joined()
+        let argBytes = bundlePath.utf8.count
+        let totalBytes = argBytes * 2
+        let argvPacket = "A\(String(totalBytes, radix: 16)),0,\(String(argBytes, radix: 16)),\(argHex),1,\(String(argBytes, radix: 16)),\(argHex)"
+        _ = try await tls.sendGDBCommand(argvPacket)
+
+        _ = try await tls.sendGDBCommand("qLaunchSuccess")
+        _ = try await tls.sendGDBCommand("D", expectResponse: false)
+
+        debugLog("[IdeviceGateway] debugAppTLSPre17() app launched successfully")
+    }
+
     public func debugApp(appId: String) async throws {
+        // iOS 16 lockdown: DVTSecureSocketProxy requires mTLS with pairing cert+key.
+        if pairingFileType == .lockdown {
+            try await self.debugAppTLSPre17(appId: appId)
+            return
+        }
         try await withFFIDispatch {
             try self.syncDebugApp(appId: appId)
         }
