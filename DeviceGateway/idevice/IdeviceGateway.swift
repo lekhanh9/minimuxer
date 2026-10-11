@@ -1264,7 +1264,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
     private func launchAppPre17(appId: String) throws {
         debugLog("[IdeviceGateway] launchAppPre17() called for appId: \(appId)")
-        let (container, bundlePath, _) = try getAppPaths(appId: appId)
+        let (container, bundlePath, exeName) = try getAppPaths(appId: appId)
 
         // FIX: iOS 16 lockdownd needs time to fully close the previous session
         // (from getAppPaths/isDDIMounted) before accepting a new one.
@@ -1299,10 +1299,12 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         try self.sendDebugProxyCommand(client: debugProxyClient, name: "QSetMaxPacketSize", args: ["\(MinimuxerConstants.maxPacketSize)"])
         try self.sendDebugProxyCommand(client: debugProxyClient, name: "QSetWorkingDir", args: [container])
 
-        try bundlePath.withCString { bundlePathPtr in
-            var argvptrs: [UnsafePointer<Int8>?] = [bundlePathPtr, bundlePathPtr]
+        let exePath = bundlePath.hasSuffix("/") ? bundlePath + exeName : bundlePath + "/" + exeName
+        verboseLog("[IdeviceGateway] launchAppPre17() executable path: \(exePath)")
+        try exePath.withCString { exePtr in
+            var argvptrs: [UnsafePointer<Int8>?] = [exePtr]
             var response: UnsafeMutablePointer<Int8>? = nil
-            verboseLog("[IdeviceGateway] launchAppPre17() setting argv for \(bundlePath)")
+            verboseLog("[IdeviceGateway] launchAppPre17() setting argv for \(exePath)")
             let argvErr = debug_proxy_set_argv(debugProxyClient, &argvptrs, UInt(argvptrs.count), &response)
             if let argvErr = argvErr {
                 let msg = self.getErrorMessage(from: argvErr)
