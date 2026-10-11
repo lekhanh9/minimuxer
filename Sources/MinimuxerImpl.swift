@@ -591,23 +591,7 @@ final internal class MinimuxerImpl: MinimuxerAPI {
                 throw MinimuxerError.noDevice("Heartbeat not ready before debugApp")
             }
 
-            
-            // FIX: Temporarily stop the heartbeat to release the active lockdown session.
-            // This prevents concurrent session conflicts when debugserver attempts to connect on iOS 16.
-            await self.heartbeat.stop()
-            defer { 
-                Task { 
-                    await self.heartbeat.start() 
-                } 
-            }
-            
-            try await self.gateway.debugApp(appId: appId)
-
-            // FIX: After debugApp finishes, wait for heartbeat to restore
-            // before returning, so EnableJITOperation's isReady() check does
-            // not hit "heartbeat has not succeeded yet" (code 18).
-            await self.heartbeat.start()
-            _ = await self.heartbeat.waitUntilReady(timeout: 8.0)
+                        try await self.gateway.debugApp(appId: appId)
         }
     }
 
@@ -642,15 +626,6 @@ final internal class MinimuxerImpl: MinimuxerAPI {
             if !hbReady {
                 debugLog("[minimuxer] attachDebugger: heartbeat wait timed out")
                 throw MinimuxerError.noDevice("Heartbeat not ready before attachDebugger")
-            }
-            
-            // Temporarily stop the heartbeat to release the active lockdown session.
-            // This prevents concurrent session conflicts when debugserver attempts to connect on iOS 16.
-            await self.heartbeat.stop()
-            defer { 
-                Task { 
-                    await self.heartbeat.start() 
-                } 
             }
             
             try await self.gateway.debugProcess(pid: pid)
