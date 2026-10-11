@@ -74,6 +74,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
     private var pairingFile: OpaquePointer? = nil
     private var lastDebugserverNeedsSSL: Bool = false
+    private var isDebugActive: Bool = false
     private var adapter: OpaquePointer? = nil
     private var handshake: OpaquePointer? = nil
 
@@ -1445,6 +1446,14 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
     private func syncPerformHeartbeat(interval: UInt64, newInterval: UnsafeMutablePointer<UInt64>) throws {
        debugLog("[IdeviceGateway] performHeartbeat() called, interval: \(interval)")
+       // Skip network activity while a debug session is active. Opening a new
+       // lockdown/heartbeat TCP session mid-debug disrupts the DVTSecureSocketProxy
+       // TLS connection (debugserver drops the peer mid-argv).
+       if self.isDebugActive {
+           verboseLog("[IdeviceGateway] performHeartbeat() skipped (debug active)")
+           newInterval.pointee = interval
+           return
+       }
        try verifyInitialized()
        try performWithEitherService(
            connectRP: heartbeat_connect_rsd,
@@ -2497,6 +2506,8 @@ extension IdeviceGateway {
         // When lockdownd_start_service reports ssl=true (DVTSecureSocketProxy on
         // iOS 16+), connectDebugProxy transparently performs the TLS handshake
         // via idevice_start_session using the pairing host identity.
+        self.isDebugActive = true
+        defer { self.isDebugActive = false }
         try await withFFIDispatch {
             try self.syncDebugApp(appId: appId)
         }
