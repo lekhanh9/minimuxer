@@ -590,6 +590,9 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         serviceName: String,
         action: (OpaquePointer) throws -> T
     ) throws -> T {
+        lockdownLock.lock()
+        defer { lockdownLock.unlock() }
+
         let maxAttempts = 3
         var attempt = 0
         while true {
@@ -647,10 +650,6 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
         var client: OpaquePointer? = nil
 
-        // Guard the lockdownd handshake on port 62078 so multiple threads don't race on SSL/start_service.
-        // Lock is released immediately once client is connected, allowing concurrent heartbeats
-        // to keep the session alive during long transfers.
-        lockdownLock.lock()
         var provider: OpaquePointer? = nil
         let provErr = try withSockaddr(ip: deviceEndpointIp, port: MinimuxerConstants.lockdowndPort) { sockaddrPtr, _ in
             sockaddrPtr.withMemoryRebound(to: idevice_sockaddr.self, capacity: 1) { reboundPtr in
@@ -658,21 +657,18 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             }
         }
         if let provErr = provErr {
-            lockdownLock.unlock()
             let msg = self.getErrorMessage(from: provErr)
             debugLog("[IdeviceGateway] error: Failed to create TCP provider: \(msg)")
             defer { safeFreeError(provErr) }
             throw IdeviceGatewayError(.connectionFailed, reason: "Failed to create TCP provider: \(msg)")
         }
         guard let provider = provider else {
-            lockdownLock.unlock()
             debugLog("[IdeviceGateway] error: TCP Provider was nil")
             throw IdeviceGatewayError(.connectionFailed, reason: "TCP Provider was nil")
         }
         providerToFree = provider
 
         let connectErr = connect(provider, &client)
-        lockdownLock.unlock()
 
         if let connectErr = connectErr {
             providerToFree = nil
@@ -1594,8 +1590,9 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
            newInterval.pointee = interval
            return
        }
-       // Wait briefly (up to 1.5s) if another thread is currently in a 50ms lockdownd connect handshake.
-       guard lockdownLock.lock(before: Date().addingTimeInterval(1.5)) else {
+       // If another lockdown service operation is active (e.g. AFC file transfer, app install, mount),
+       // skip heartbeat so we do not disrupt the in-flight session on port 62078.
+       guard lockdownLock.try() else {
            verboseLog("[IdeviceGateway] performHeartbeat() skipped (gateway busy with another operation)")
            newInterval.pointee = interval
            return
@@ -1699,6 +1696,8 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     }
 
     private func mountPersonalizedDdiIdevice(image: Data, trustcache: Data, manifest: Data) throws {
+        lockdownLock.lock()
+        defer { lockdownLock.unlock() }
         verboseLog("[IdeviceGateway] mountPersonalizedDdiIdevice() starting traditional/TCP provider mounting")
 
         guard let deviceEndpointIp = deviceEndpointIp else {
