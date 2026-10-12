@@ -1374,6 +1374,27 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         try self.sendDebugProxyCommand(client: debugProxyClient, name: "QSetMaxPacketSize:", args: ["\(MinimuxerConstants.maxPacketSize)"])
         try self.sendDebugProxyCommand(client: debugProxyClient, name: "QSetWorkingDir:", args: [container])
 
+        // Pass standard sandbox environment variables to inferior process.
+        // Debugserver posix_spawn creates a bare environment unless explicitly set,
+        // causing apps like LiveContainer to crash (assert in DyldHooksInit / initGuestSDKVersionInfo)
+        // when attempting to resolve HOME/TMPDIR.
+        let homeDir = container.hasSuffix("/") ? String(container.dropLast()) : container
+        let tmpDir = "\(homeDir)/tmp/"
+        let envVars = [
+            "HOME=\(homeDir)",
+            "TMPDIR=\(tmpDir)",
+            "CFFIXED_USER_HOME=\(homeDir)",
+            "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
+        ]
+        for env in envVars {
+            let hex = env.utf8.map { String(format: "%02x", $0) }.joined()
+            var resp = try? self.sendDebugProxyCommand(client: debugProxyClient, name: "QEnvironmentHexEncoded:\(hex)", args: [])
+            if resp == nil || resp?.isEmpty == true {
+                resp = try? self.sendDebugProxyCommand(client: debugProxyClient, name: "QEnvironment:\(env)", args: [])
+            }
+            debugLog("[IdeviceGateway] launchAppPre17() set env \(env) resp: \(resp ?? "(nil)")")
+        }
+
         guard let exeNameStr = exeName else {
             throw IdeviceGatewayError(.serviceError, reason: "getAppPaths returned nil exeName for \(appId)")
         }
