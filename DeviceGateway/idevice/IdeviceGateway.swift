@@ -2658,17 +2658,19 @@ extension IdeviceGateway {
         // iOS 16+), connectDebugProxy transparently performs the TLS handshake
         // via idevice_start_session using the pairing host identity.
         self.isDebugActive = true
-        do {
-            try await withFFIDispatch {
-                try self.syncDebugApp(appId: appId)
-            }
-        } catch {
+        defer {
             self.isDebugActive = false
-            throw error
+        }
+        try await withFFIDispatch {
+            try self.syncDebugApp(appId: appId)
         }
     }
 
     public func debugProcess(pid: UInt32) async throws {
+        self.isDebugActive = true
+        defer {
+            self.isDebugActive = false
+        }
         try await withFFIDispatch {
             try self.syncDebugProcess(pid: pid)
         }

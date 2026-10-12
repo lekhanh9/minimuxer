@@ -598,7 +598,19 @@ final internal class MinimuxerImpl: MinimuxerAPI {
                 throw MinimuxerError.noDevice("Heartbeat not ready before debugApp")
             }
 
-                        try await self.gateway.debugApp(appId: appId)
+            do {
+                try await self.gateway.debugApp(appId: appId)
+            } catch {
+                verboseLog("[minimuxer] debugApp failed, restarting heartbeat session...")
+                _ = await self.heartbeat.restart(timeout: 5.0)
+                throw error
+            }
+
+            // FIX: After JIT enabling finishes, stop and restart heartbeat
+            // to establish a clean lockdown session for sideloading and other SideStore services.
+            verboseLog("[minimuxer] debugApp finished, restarting heartbeat for fresh lockdown session...")
+            let restarted = await self.heartbeat.restart(timeout: 8.0)
+            verboseLog("[minimuxer] post-debug heartbeat restart result: \(restarted)")
         }
     }
 
@@ -635,7 +647,17 @@ final internal class MinimuxerImpl: MinimuxerAPI {
                 throw MinimuxerError.noDevice("Heartbeat not ready before attachDebugger")
             }
             
-            try await self.gateway.debugProcess(pid: pid)
+            do {
+                try await self.gateway.debugProcess(pid: pid)
+            } catch {
+                verboseLog("[minimuxer] attachDebugger failed, restarting heartbeat session...")
+                _ = await self.heartbeat.restart(timeout: 5.0)
+                throw error
+            }
+
+            verboseLog("[minimuxer] attachDebugger finished, restarting heartbeat for fresh lockdown session...")
+            let restarted = await self.heartbeat.restart(timeout: 8.0)
+            verboseLog("[minimuxer] post-debug heartbeat restart result: \(restarted)")
         }
     }
 

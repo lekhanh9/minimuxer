@@ -81,14 +81,26 @@ final internal class HeartbeatService {
         self.heartbeatTask = task
     }
 
-    /// Signal the heartbeat task to stop. Will exit on next iteration.
-    /// Also cancels the task handle for faster shutdown.
+    /// Signal the heartbeat task to stop and wait for it to terminate cleanly.
     func stop() async {
         await state.stop()
         lastBeatSuccessful = false
-        heartbeatTask?.cancel()
+        let task = heartbeatTask
         heartbeatTask = nil
-        verboseLog("[minimuxer] HeartbeatService stop requested")
+        task?.cancel()
+        _ = await task?.value
+        await state.terminate()
+        verboseLog("[minimuxer] HeartbeatService stop completed")
+    }
+
+    /// Restart the heartbeat loop and optionally wait until the first heartbeat succeeds.
+    @discardableResult
+    func restart(timeout: TimeInterval = 8.0) async -> Bool {
+        verboseLog("[minimuxer] HeartbeatService restarting...")
+        await stop()
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        await start()
+        return await waitUntilReady(timeout: timeout)
     }
 
     // MARK: - Readiness
