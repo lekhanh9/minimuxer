@@ -68,6 +68,9 @@ actor DeviceConnectionManager {
             debugLog("[minimuxer] [iface] tcpProbe skipped  IP is nil or empty")
             return false
         }
+        if gateway.isBusy {
+            return true
+        }
         let currentProtocol = gateway.pairingFileType
         let currentPort = gateway.servicePort
         var reachable = NetworkUtils.testTCP(ip: ip, port: currentPort, timeoutMs: deviceProbeTimeout)

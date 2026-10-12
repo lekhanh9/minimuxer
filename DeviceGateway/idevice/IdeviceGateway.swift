@@ -101,6 +101,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     private var pairingFile: OpaquePointer? = nil
     private var lastDebugserverNeedsSSL: Bool = false
     private var isDebugActive: Bool = false
+    private var isTransferActive: Bool = false
     // PATCH: hold reference to debug_proxy client so it survives debugApp() return
     private var activeDebugClient: OpaquePointer?
     private var adapter: OpaquePointer? = nil
@@ -109,6 +110,17 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     // Serializes TCP lockdown service sessions to prevent concurrent connection
     // thrashing and TLS session drops on iOS lockdown services (port 62078).
     private let lockdownLock = NSRecursiveLock()
+
+    public var isBusy: Bool {
+        if self.isDebugActive || self.isTransferActive {
+            return true
+        }
+        if !lockdownLock.try() {
+            return true
+        }
+        lockdownLock.unlock()
+        return false
+    }
 
     public override init() {
         try! super.init()
@@ -602,7 +614,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             } catch {
                 guard attempt < maxAttempts, isTransportError(error) else { throw error }
                 debugLog("[IdeviceGateway] performWithTcpService(\(serviceName)) transport error on attempt \(attempt)/\(maxAttempts): \(error). Retrying with a fresh session...")
-                Thread.sleep(forTimeInterval: 0.4 * Double(attempt))
+                Thread.sleep(forTimeInterval: 1.0 * Double(attempt))
             }
         }
     }
@@ -851,6 +863,8 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     }
 
     private func syncsendIpaAfc(bundleId: String, ipaBytes: Data) throws {
+        self.isTransferActive = true
+        defer { self.isTransferActive = false }
         debugLog("[IdeviceGateway] sendIpaAfc() called, bundleId: \(bundleId), ipaBytes size: \(ipaBytes.count)")
         try verifyInitialized()
         try performWithEitherService(
@@ -922,6 +936,8 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     }
 
     private func syncInstallIpa(bundleId: String) throws {
+        self.isTransferActive = true
+        defer { self.isTransferActive = false }
         debugLog("[IdeviceGateway] installIpa() called, bundleId: \(bundleId)")
         try verifyInitialized()
         try performWithEitherService(
@@ -946,6 +962,8 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     }
 
     private func syncsendAppBundleAfc(bundleId: String, appURL: URL) throws {
+        self.isTransferActive = true
+        defer { self.isTransferActive = false }
         debugLog("[IdeviceGateway] sendAppBundleAfc() called, bundleId: \(bundleId), appURL: \(appURL.path)")
         try verifyInitialized()
         try performWithEitherService(
@@ -1033,6 +1051,8 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     }
 
     private func syncInstallAppBundle(bundleId: String, appName: String) throws {
+        self.isTransferActive = true
+        defer { self.isTransferActive = false }
         debugLog("[IdeviceGateway] installAppBundle() called, bundleId: \(bundleId), appName: \(appName)")
         try verifyInitialized()
         try performWithEitherService(

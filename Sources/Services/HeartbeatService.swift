@@ -147,20 +147,18 @@ final internal class HeartbeatService {
         var currentInterval: UInt64 = MinimuxerConstants.heartbeatInterval
 
         while await state.running && !Task.isCancelled {
+            // If the gateway is currently busy with a file transfer, install, or debug session,
+            // yield and wait so we never probe or disrupt port 62078 mid-transfer.
+            if self.gateway.isBusy {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                continue
+            }
+
             let tunnelPeerIp: String
             do {
                 tunnelPeerIp = try await self.endpoint.ip()
             } catch {
                 logIfNeeded("device IP unavailable", isVerbose: true)
-                lastBeatSuccessful = false
-                try? await Task.sleep(nanoseconds: sleepNs)
-                continue
-            }
-
-            // verify tunnel/device reachability first
-            let targetPort = self.gateway.servicePort
-            if !NetworkUtils.testTCP(ip: tunnelPeerIp, port: targetPort) {
-                logIfNeeded("device IP not reachable, waiting...", isVerbose: true)
                 lastBeatSuccessful = false
                 try? await Task.sleep(nanoseconds: sleepNs)
                 continue
