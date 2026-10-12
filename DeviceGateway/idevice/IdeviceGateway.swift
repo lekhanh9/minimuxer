@@ -590,9 +590,6 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         serviceName: String,
         action: (OpaquePointer) throws -> T
     ) throws -> T {
-        lockdownLock.lock()
-        defer { lockdownLock.unlock() }
-
         let maxAttempts = 3
         var attempt = 0
         while true {
@@ -641,23 +638,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             throw IdeviceGatewayError(.connectionFailed, reason: "Temporary pairing file was nil")
         }
 
-        var provider: OpaquePointer? = nil
-        let provErr = try withSockaddr(ip: deviceEndpointIp, port: MinimuxerConstants.lockdowndPort) { sockaddrPtr, _ in
-            sockaddrPtr.withMemoryRebound(to: idevice_sockaddr.self, capacity: 1) { reboundPtr in
-                return idevice_tcp_provider_new(reboundPtr, tempPairingFile, MinimuxerConstants.appName, &provider)
-            }
-        }
-        if let provErr = provErr {
-            let msg = self.getErrorMessage(from: provErr)
-            debugLog("[IdeviceGateway] error: Failed to create TCP provider: \(msg)")
-            defer { safeFreeError(provErr) }
-            throw IdeviceGatewayError(.connectionFailed, reason: "Failed to create TCP provider: \(msg)")
-        }
-        guard let provider = provider else {
-            debugLog("[IdeviceGateway] error: TCP Provider was nil")
-            throw IdeviceGatewayError(.connectionFailed, reason: "TCP Provider was nil")
-        }
-        var providerToFree: OpaquePointer? = provider
+        var providerToFree: OpaquePointer? = nil
         defer {
             if let ptr = providerToFree {
                 idevice_provider_free(ptr)
@@ -665,7 +646,34 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         }
 
         var client: OpaquePointer? = nil
+
+        // Guard the lockdownd handshake on port 62078 so multiple threads don't race on SSL/start_service.
+        // Lock is released immediately once client is connected, allowing concurrent heartbeats
+        // to keep the session alive during long transfers.
+        lockdownLock.lock()
+        var provider: OpaquePointer? = nil
+        let provErr = try withSockaddr(ip: deviceEndpointIp, port: MinimuxerConstants.lockdowndPort) { sockaddrPtr, _ in
+            sockaddrPtr.withMemoryRebound(to: idevice_sockaddr.self, capacity: 1) { reboundPtr in
+                return idevice_tcp_provider_new(reboundPtr, tempPairingFile, MinimuxerConstants.appName, &provider)
+            }
+        }
+        if let provErr = provErr {
+            lockdownLock.unlock()
+            let msg = self.getErrorMessage(from: provErr)
+            debugLog("[IdeviceGateway] error: Failed to create TCP provider: \(msg)")
+            defer { safeFreeError(provErr) }
+            throw IdeviceGatewayError(.connectionFailed, reason: "Failed to create TCP provider: \(msg)")
+        }
+        guard let provider = provider else {
+            lockdownLock.unlock()
+            debugLog("[IdeviceGateway] error: TCP Provider was nil")
+            throw IdeviceGatewayError(.connectionFailed, reason: "TCP Provider was nil")
+        }
+        providerToFree = provider
+
         let connectErr = connect(provider, &client)
+        lockdownLock.unlock()
+
         if let connectErr = connectErr {
             providerToFree = nil
             let msg = self.getErrorMessage(from: connectErr)
@@ -887,18 +895,32 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
                 afc_file_close(fileHandle)
             }
  
+            let chunkSize = 64 * 1024 // 64 KB (AFC MAXIMUM_PACKET_SIZE)
+            let totalBytes = ipaBytes.count
+            var offset = 0
+            var lastLoggedOffset = 0
+            verboseLog("[IdeviceGateway] sendIpaAfc() writing \(totalBytes) bytes to AFC file in \(chunkSize) byte chunks")
             try ipaBytes.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
-                if let baseAddress = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) {
-                    verboseLog("[IdeviceGateway] sendIpaAfc() writing data to AFC file")
-                    let writeErr = afc_file_write(fileHandle, baseAddress, ipaBytes.count)
+                guard let baseAddress = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    throw IdeviceGatewayError(.serviceError, reason: "Invalid IPA buffer")
+                }
+                while offset < totalBytes {
+                    let bytesToWrite = min(chunkSize, totalBytes - offset)
+                    let chunkPtr = baseAddress.advanced(by: offset)
+                    let writeErr = afc_file_write(fileHandle, chunkPtr, bytesToWrite)
                     if let writeErr = writeErr {
                         let msg = self.getErrorMessage(from: writeErr)
-                        debugLog("[IdeviceGateway] sendIpaAfc() afc_file_write failed: \(msg)")
+                        debugLog("[IdeviceGateway] sendIpaAfc() afc_file_write failed at \(offset)/\(totalBytes): \(msg)")
                         defer { idevice_error_free(writeErr) }
-                        throw IdeviceGatewayError(.serviceError, reason: "Failed to write to AFC file, error: (\(msg))")
+                        throw IdeviceGatewayError(.serviceError, reason: "Failed to write to AFC file at \(offset)/\(totalBytes), error: (\(msg))")
                     }
-                    debugLog("[IdeviceGateway] sendIpaAfc() afc_file_write succeeded")
+                    offset += bytesToWrite
+                    if offset - lastLoggedOffset >= 10 * 1024 * 1024 || offset == totalBytes {
+                        debugLog("[IdeviceGateway] sendIpaAfc() progress: \(offset)/\(totalBytes) bytes (\(Int(Double(offset) / Double(totalBytes) * 100))%)")
+                        lastLoggedOffset = offset
+                    }
                 }
+                debugLog("[IdeviceGateway] sendIpaAfc() afc_file_write completed successfully for all \(totalBytes) bytes")
             }
         }
     }
@@ -990,14 +1012,21 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
                     let fileData = try Data(contentsOf: fileURL, options: .alwaysMapped)
                     if !fileData.isEmpty {
+                        let chunkSize = 64 * 1024
+                        let totalBytes = fileData.count
+                        var offset = 0
                         try fileData.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
-                            if let baseAddress = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) {
-                                let writeErr = afc_file_write(fileHandle, baseAddress, fileData.count)
+                            guard let baseAddress = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                            while offset < totalBytes {
+                                let bytesToWrite = min(chunkSize, totalBytes - offset)
+                                let chunkPtr = baseAddress.advanced(by: offset)
+                                let writeErr = afc_file_write(fileHandle, chunkPtr, bytesToWrite)
                                 if let writeErr = writeErr {
                                     let msg = self.getErrorMessage(from: writeErr)
                                     defer { idevice_error_free(writeErr) }
                                     throw IdeviceGatewayError(.serviceError, reason: "Failed to write to AFC file \(remoteItemPath): \(msg)")
                                 }
+                                offset += bytesToWrite
                             }
                         }
                     }
@@ -1565,9 +1594,8 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
            newInterval.pointee = interval
            return
        }
-       // If another lockdown service operation is active, skip heartbeat so we do not
-       // disrupt an in-flight transfer, mount, or install on port 62078.
-       guard lockdownLock.try() else {
+       // Wait briefly (up to 1.5s) if another thread is currently in a 50ms lockdownd connect handshake.
+       guard lockdownLock.lock(before: Date().addingTimeInterval(1.5)) else {
            verboseLog("[IdeviceGateway] performHeartbeat() skipped (gateway busy with another operation)")
            newInterval.pointee = interval
            return
