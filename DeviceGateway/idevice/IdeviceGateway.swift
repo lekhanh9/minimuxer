@@ -107,6 +107,10 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
     private var adapter: OpaquePointer? = nil
     private var handshake: OpaquePointer? = nil
 
+    private var persistentHeartbeatClient: OpaquePointer? = nil
+    private var persistentHeartbeatProvider: OpaquePointer? = nil
+    private let heartbeatLock = NSLock()
+
     // Serializes TCP lockdown service sessions to prevent concurrent connection
     // thrashing and TLS session drops on iOS lockdown services (port 62078).
     private let lockdownLock = NSRecursiveLock()
@@ -132,6 +136,7 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
 
     public override func cleanup() {
         debugLog("[IdeviceGateway] cleanup() called")
+        closePersistentHeartbeat()
         if let pairingFile = self.pairingFile {
             verboseLog("[IdeviceGateway] cleanup() freeing pairingFile")
             if pairingFileType == .rppairing {
@@ -153,8 +158,28 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         }
     }
 
+    private func closePersistentHeartbeat() {
+        heartbeatLock.lock()
+        defer { heartbeatLock.unlock() }
+        closePersistentHeartbeatLocked()
+    }
+
+    private func closePersistentHeartbeatLocked() {
+        if let client = self.persistentHeartbeatClient {
+            verboseLog("[IdeviceGateway] closePersistentHeartbeat() freeing client")
+            heartbeat_client_free(client)
+            self.persistentHeartbeatClient = nil
+        }
+        if let provider = self.persistentHeartbeatProvider {
+            verboseLog("[IdeviceGateway] closePersistentHeartbeat() freeing provider")
+            idevice_provider_free(provider)
+            self.persistentHeartbeatProvider = nil
+        }
+    }
+
     public override func invalidateConnection() {
-        debugLog("[IdeviceGateway] invalidateConnection() called - clearing stale adapter and handshake")
+        debugLog("[IdeviceGateway] invalidateConnection() called - clearing stale adapter, handshake and heartbeat")
+        closePersistentHeartbeat()
         if let handshake = handshake {
             rsd_handshake_free(handshake)
             self.handshake = nil
@@ -886,9 +911,6 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
             }
  
             let path = "\(bundleDir)/app.ipa"
-            _ = path.withCString { pathPtr in
-                afc_remove_path(client, pathPtr)
-            }
             var fileHandle: OpaquePointer? = nil
             verboseLog("[IdeviceGateway] sendIpaAfc() opening remote file: \(path)")
             let openErr = path.withCString { pathPtr in
@@ -1600,50 +1622,143 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI, @uncheck
         }
     }
 
-    private func syncPerformHeartbeat(interval: UInt64, newInterval: UnsafeMutablePointer<UInt64>) throws {
-       debugLog("[IdeviceGateway] performHeartbeat() called, interval: \(interval)")
-       // Skip network activity while a debug session is active. Opening a new
-       // lockdown/heartbeat TCP session mid-debug disrupts the DVTSecureSocketProxy
-       // TLS connection (debugserver drops the peer mid-argv).
-       if self.isDebugActive {
-           verboseLog("[IdeviceGateway] performHeartbeat() skipped (debug active)")
-           newInterval.pointee = interval
-           return
-       }
-       // If another lockdown service operation is active (e.g. AFC file transfer, app install, mount),
-       // skip heartbeat so we do not disrupt the in-flight session on port 62078.
-       guard lockdownLock.try() else {
-           verboseLog("[IdeviceGateway] performHeartbeat() skipped (gateway busy with another operation)")
-           newInterval.pointee = interval
-           return
-       }
-       defer { lockdownLock.unlock() }
+    private func ensureHeartbeatConnectedLocked() throws -> OpaquePointer {
+        if let client = self.persistentHeartbeatClient {
+            return client
+        }
 
-       try verifyInitialized()
-       try performWithEitherService(
-           connectRP: heartbeat_connect_rsd,
-           connectLockdown: heartbeat_connect,
-           cleanup: heartbeat_client_free,
-           serviceName: "heartbeat"
-       ) { client in
-           verboseLog("[IdeviceGateway] performHeartbeat() calling heartbeat_get_marco")
-           let getErr = heartbeat_get_marco(client, interval, newInterval)
-           if let getErr = getErr {
-               let msg = self.getErrorMessage(from: getErr)
-               debugLog("[IdeviceGateway] performHeartbeat() heartbeat_get_marco failed: \(msg)")
-               defer { idevice_error_free(getErr) }
-               throw IdeviceGatewayError(.serviceError, reason: "Heartbeat receive failed, error: (\(msg))")
-           }
-           verboseLog("[IdeviceGateway] performHeartbeat() calling heartbeat_send_polo")
-           let sendErr = heartbeat_send_polo(client)
-           if let sendErr = sendErr {
-               let msg = self.getErrorMessage(from: sendErr)
-               debugLog("[IdeviceGateway] performHeartbeat() heartbeat_send_polo failed: \(msg)")
-               defer { idevice_error_free(sendErr) }
-               throw IdeviceGatewayError(.serviceError, reason: "Heartbeat send failed, error: (\(msg))")
-           }
-           debugLog("[IdeviceGateway] performHeartbeat() succeeded, newInterval: \(newInterval.pointee)")
-       }
+        try verifyInitialized()
+
+        if pairingFileType == .rppairing {
+            guard let adapter = self.adapter, let handshake = self.handshake else {
+                throw IdeviceGatewayError(.noConnection, reason: "Adapter or handshake is nil")
+            }
+            var client: OpaquePointer? = nil
+            let connectErr = heartbeat_connect_rsd(adapter, handshake, &client)
+            if let connectErr = connectErr {
+                let msg = self.getErrorMessage(from: connectErr)
+                debugLog("[IdeviceGateway] heartbeat_connect_rsd failed: \(msg)")
+                defer { safeFreeError(connectErr) }
+                throw IdeviceGatewayError(.serviceError, reason: "Failed to connect to heartbeat via RSD: (\(msg))")
+            }
+            guard let client = client else {
+                throw IdeviceGatewayError(.noConnection)
+            }
+            self.persistentHeartbeatClient = client
+            return client
+        } else {
+            lockdownLock.lock()
+            defer { lockdownLock.unlock() }
+
+            guard let deviceEndpointIp = deviceEndpointIp else {
+                throw IdeviceGatewayError(.deviceEndpointIpNotAvailable)
+            }
+            guard let pairingFileData = self.pairingFileData else {
+                throw IdeviceGatewayError(.connectionFailed, reason: "pairingFileData is nil")
+            }
+
+            var tempPairingFile: OpaquePointer? = nil
+            let parseErr = pairingFileData.withUnsafeBytes { buf in
+                return idevice_pairing_file_from_bytes(buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt(pairingFileData.count), &tempPairingFile)
+            }
+            if let parseErr = parseErr {
+                let msg = self.getErrorMessage(from: parseErr)
+                defer { safeFreeError(parseErr) }
+                throw IdeviceGatewayError(.connectionFailed, reason: "Failed to parse temporary pairing file: \(msg)")
+            }
+            guard let tempPairingFile = tempPairingFile else {
+                throw IdeviceGatewayError(.connectionFailed, reason: "Temporary pairing file was nil")
+            }
+            defer {
+                idevice_pairing_file_free(tempPairingFile)
+            }
+
+            var provider: OpaquePointer? = nil
+            let provErr = try withSockaddr(ip: deviceEndpointIp, port: MinimuxerConstants.lockdowndPort) { sockaddrPtr, _ in
+                sockaddrPtr.withMemoryRebound(to: idevice_sockaddr.self, capacity: 1) { reboundPtr in
+                    return idevice_tcp_provider_new(reboundPtr, tempPairingFile, MinimuxerConstants.appName, &provider)
+                }
+            }
+            if let provErr = provErr {
+                let msg = self.getErrorMessage(from: provErr)
+                defer { safeFreeError(provErr) }
+                throw IdeviceGatewayError(.connectionFailed, reason: "Failed to create TCP provider: \(msg)")
+            }
+            guard let provider = provider else {
+                throw IdeviceGatewayError(.connectionFailed, reason: "TCP Provider was nil")
+            }
+
+            var client: OpaquePointer? = nil
+            let connectErr = heartbeat_connect(provider, &client)
+            if let connectErr = connectErr {
+                idevice_provider_free(provider)
+                let msg = self.getErrorMessage(from: connectErr)
+                defer { safeFreeError(connectErr) }
+                throw IdeviceGatewayError(.serviceError, reason: "Failed to connect to heartbeat: (\(msg))")
+            }
+            guard let client = client else {
+                idevice_provider_free(provider)
+                throw IdeviceGatewayError(.noConnection)
+            }
+
+            self.persistentHeartbeatProvider = provider
+            self.persistentHeartbeatClient = client
+            return client
+        }
+    }
+
+    private func syncPerformHeartbeat(interval: UInt64, newInterval: UnsafeMutablePointer<UInt64>) throws {
+        debugLog("[IdeviceGateway] performHeartbeat() called, interval: \(interval)")
+        // Skip network activity while a debug session is active. Opening a new
+        // lockdown/heartbeat TCP session mid-debug disrupts the DVTSecureSocketProxy
+        // TLS connection (debugserver drops the peer mid-argv).
+        if self.isDebugActive {
+            verboseLog("[IdeviceGateway] performHeartbeat() skipped (debug active)")
+            newInterval.pointee = interval
+            return
+        }
+
+        heartbeatLock.lock()
+        defer { heartbeatLock.unlock() }
+
+        // If not connected yet and gateway is busy with another operation,
+        // do not establish a new connection on port 62078 right now.
+        if self.persistentHeartbeatClient == nil && self.isBusy {
+            verboseLog("[IdeviceGateway] performHeartbeat() skipped connecting (gateway busy)")
+            newInterval.pointee = interval
+            return
+        }
+
+        let client: OpaquePointer
+        do {
+            client = try ensureHeartbeatConnectedLocked()
+        } catch {
+            debugLog("[IdeviceGateway] performHeartbeat() failed to connect: \(error)")
+            closePersistentHeartbeatLocked()
+            throw error
+        }
+
+        verboseLog("[IdeviceGateway] performHeartbeat() calling heartbeat_get_marco")
+        let getErr = heartbeat_get_marco(client, interval, newInterval)
+        if let getErr = getErr {
+            let msg = self.getErrorMessage(from: getErr)
+            debugLog("[IdeviceGateway] performHeartbeat() heartbeat_get_marco failed: \(msg)")
+            defer { safeFreeError(getErr) }
+            closePersistentHeartbeatLocked()
+            throw IdeviceGatewayError(.serviceError, reason: "Heartbeat receive failed, error: (\(msg))")
+        }
+
+        verboseLog("[IdeviceGateway] performHeartbeat() calling heartbeat_send_polo")
+        let sendErr = heartbeat_send_polo(client)
+        if let sendErr = sendErr {
+            let msg = self.getErrorMessage(from: sendErr)
+            debugLog("[IdeviceGateway] performHeartbeat() heartbeat_send_polo failed: \(msg)")
+            defer { safeFreeError(sendErr) }
+            closePersistentHeartbeatLocked()
+            throw IdeviceGatewayError(.serviceError, reason: "Heartbeat send failed, error: (\(msg))")
+        }
+
+        debugLog("[IdeviceGateway] performHeartbeat() succeeded, newInterval: \(newInterval.pointee)")
     }
 
     private func syncMountPersonalizedDdi(image: Data, trustcache: Data, manifest: Data) throws {

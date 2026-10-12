@@ -147,13 +147,6 @@ final internal class HeartbeatService {
         var currentInterval: UInt64 = MinimuxerConstants.heartbeatInterval
 
         while await state.running && !Task.isCancelled {
-            // If the gateway is currently busy with a file transfer, install, or debug session,
-            // yield and wait so we never probe or disrupt port 62078 mid-transfer.
-            if self.gateway.isBusy {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                continue
-            }
-
             let tunnelPeerIp: String
             do {
                 tunnelPeerIp = try await self.endpoint.ip()
@@ -171,15 +164,16 @@ final internal class HeartbeatService {
             } catch {
                 logIfNeeded("Heartbeat failed: \(error)")
                 lastBeatSuccessful = false
+                currentInterval = MinimuxerConstants.heartbeatInterval
             }
 
             // FIX: sleep between beats on BOTH success and failure paths.
-            // Previously missing on success -> runaway loop -> lockdownd session thrashing
-            // -> debugserver failed with SessionInactive on iOS 16.
-            // Clamp to [5, 60] seconds to prevent runaway loop and battery drain.
-            let clampedSeconds = min(max(currentInterval, 5), 60)
+            // Clamp to [5, 60] seconds and reply at ~75% of interval (min 4s) to ensure
+            // Marco is answered before the 10-second device watchdog expires.
+            let clampedInterval = min(max(currentInterval, 5), 60)
+            let sleepSeconds = max(Double(clampedInterval) * 0.75, 4.0)
             if Task.isCancelled { return }
-            try? await Task.sleep(nanoseconds: UInt64(clampedSeconds) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))
         }
     }
 }
